@@ -1,27 +1,29 @@
-'''
-Utilities for parsing the corefile, operating with memory ranges
-and other low level stuff.
-'''
-
 import enum
-from io import SEEK_CUR, SEEK_END, SEEK_SET, RawIOBase, UnsupportedOperation
 import itertools
 import mmap
 import struct
+
 from typing import Any, BinaryIO, Callable, Iterator, Literal, NamedTuple, TypeVar, Union, Optional  
+from dataclasses import dataclass
+
 from elftools.elf.elffile import ELFFile
 from elftools.elf.structs import ELFStructs
 from elftools.elf.sections import Symbol as ELFSymbol
 from elftools.elf.segments import Segment
-from unicorn.unicorn import uc, Uc, x86_const
+from unicorn.unicorn import uc, x86_const
 from elftools.elf.constants import P_FLAGS
-from dataclasses import dataclass
 
 import io
 
+import unicorn
+
+
 # get real size of mmap'ed region, i.e. rounding up by PAGESIZE
-mmapsize = lambda s: ((s - 1) // mmap.PAGESIZE + 1) * mmap.PAGESIZE
-mmapalign = lambda s: (s // mmap.PAGESIZE) * mmap.PAGESIZE
+def mmapsize(s):
+    return ((s - 1) // mmap.PAGESIZE + 1) * mmap.PAGESIZE
+
+def mmapalign(s):
+    return (s // mmap.PAGESIZE) * mmap.PAGESIZE
 
 def try_enum(cls, x):
     try:
@@ -62,10 +64,10 @@ def write_str(
     fx[:len(x)] = x
     return st.write(fx)
 
-class UnicornIO(RawIOBase):
+class UnicornIO(io.RawIOBase):
     '''Exposes (part of) the memory of a Unicorn engine as a raw I/O stream'''
 
-    uc: Uc
+    uc: unicorn.unicorn.Uc
     start: int
     size: int
     offset: int
@@ -89,16 +91,16 @@ class UnicornIO(RawIOBase):
     def tell(self):
         return self.offset
 
-    def seek(self, offset: int, whence: int=SEEK_SET):
+    def seek(self, offset: int, whence: int=io.SEEK_SET):
         assert isinstance(offset, int)
-        offset += { SEEK_SET: 0, SEEK_CUR: self.offset, SEEK_END: self.size }[whence]
+        offset += {io.SEEK_SET: 0, io.SEEK_CUR: self.offset, io.SEEK_END: self.size}[whence]
         if not (0 <= offset <= self.size):
             # FIXME: should we also check it's a mapped position?
             raise ValueError(f'out-of-bounds offset: {offset}')
         self.offset = offset
 
     def truncate(self, size=None):
-        raise UnsupportedOperation('fixed memory region, truncation not supported')
+        raise io.UnsupportedOperation('fixed memory region, truncation not supported')
 
     # FIXME: check readable, writeable, seekable return True, check reexports accessible
     def read(self, size=-1) -> bytearray:

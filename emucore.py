@@ -1,6 +1,5 @@
 from typing import Callable, Literal, Optional, Union
-from unicorn.unicorn import UcContext, UcError, uc, x86_const
-from elftools.elf import elffile, sections
+from unicorn.unicorn import uc, x86_const
 
 from utils import read_struct, write_struct, read_bstr, read_str, write_str, \
     sort_and_ensure_disjoint, VMA, \
@@ -24,7 +23,9 @@ import re
 import struct
 
 import boto3
+import elftools
 import humanize
+import iced_x86
 import s3path
 import sortedcontainers
 import unicorn
@@ -109,7 +110,7 @@ class EmuCore(object):
     # open resources (FIXME: make this class a context manager)
     emu: unicorn.Uc
     stack_tracer: 'StackTracer'
-    core: elffile.ELFFile
+    core: elftools.elf.elffile.ELFFile
     core_mm: mmap.mmap
     mappings_mm: dict[bytes, tuple[bytes, mmap.mmap]]
 
@@ -129,7 +130,7 @@ class EmuCore(object):
         ]
     ]
 
-    emu_ctx: UcContext
+    emu_ctx: unicorn.unicorn.UcContext
 
     # stack management
     stack_base: int
@@ -186,20 +187,21 @@ class EmuCore(object):
         # Start by opening the core file
         self.__s3 = boto3.client('s3')
         self.__s3_path = s3path.S3Path.from_uri(filename)
+        self.__filename = filename
         self.__size = self.__s3.head_object(Bucket=self.__s3_path.bucket, Key=self.__s3_path.key)['ContentLength']
 
-        size = 10*1024*1024
+        size = 5*1024*1024
         print(f'Loading header, size {humanize.naturalsize(size)}')
         self.__header = io.BytesIO(self.__s3.get_object(Bucket=self.__s3_path.bucket, Key=self.__s3_path.key, Range=f'bytes=0-{size-1}')['Body'].read())
 
-        self.core = elffile.ELFFile(self.__header)
+        self.core = elftools.elf.elffile.ELFFile(self.__header)
         assert self.core['e_ident']['EI_OSABI'] in {'ELFOSABI_SYSV', 'ELFOSABI_LINUX'}, 'only Linux supported'
         assert self.core['e_machine'] == 'EM_X86_64', 'only x86-64 supported'
         assert self.core['e_type'] == 'ET_CORE', 'not a core file'
 
         # Parse coredump notes
         segs = self.core.iter_segments()
-        note_segs = filter(lambda seg: isinstance(seg, elffile.NoteSegment), segs)
+        note_segs = filter(lambda seg: isinstance(seg, elftools.elf.elffile.NoteSegment), segs)
         notes = [n for seg in note_segs for n in seg.iter_notes()]
 
         # files
@@ -280,7 +282,7 @@ class EmuCore(object):
             except:
                 return False
 
-            size, prot, offset = self.__mappings_to_load[to_map_address]
+            module, size, prot, offset = self.__mappings_to_load[to_map_address]
             if to_map_address + size > address:
                 self.__mappings_to_load.pop(to_map_address)
 
@@ -289,15 +291,16 @@ class EmuCore(object):
 
                 else:
                     start_address = utils.mmapalign(address)
-                    self.__mappings_to_load[to_map_address] = (start_address-to_map_address, prot, offset)
+                    self.__mappings_to_load[to_map_address] = (module, start_address-to_map_address, prot, offset)
                     if to_map_address + size - start_address >= 1024*1024:
-                        self.__mappings_to_load[start_address+1024*1024] = (to_map_address+size-start_address-1024*1024, prot, offset+start_address+1024*1024-to_map_address)
+                        self.__mappings_to_load[start_address+1024*1024] = (module, to_map_address+size-start_address-1024*1024, prot, offset+start_address+1024*1024-to_map_address)
                     size = 1024*1024
-                    offset = start_address-to_map_address
+                    offset = offset+start_address-to_map_address
 
-                print(f'Loading {hex(start_address)}..{hex(start_address+size)}, size {humanize.naturalsize(size)}')
+                print(f'Loading {hex(start_address)}..{hex(start_address+size)} from {module}, size {humanize.naturalsize(size)}')
 
-                data = self.__s3.get_object(Bucket=self.__s3_path.bucket, Key=self.__s3_path.key, Range=f'bytes={offset}-{offset+size-1}')['Body'].read()
+                s3_path = s3path.S3Path.from_uri(module)
+                data = self.__s3.get_object(Bucket=s3_path.bucket, Key=s3_path.key, Range=f'bytes={offset}-{offset+size-1}')['Body'].read()
                 self.emu.mem_map(start_address, size, prot)
                 self.emu.mem_write(start_address, data)
                 self.__loaded_mappings[start_address] = size
@@ -320,7 +323,7 @@ class EmuCore(object):
             if vma.offset_end > utils.mmapsize(self.__size):
                 print(f'Segment {hex(vma.start)}-{hex(vma.start+vma.size)} exceeds file size, looks like the core dump is truncated.')
             else:
-                self.__mappings_to_load[vma.start] = (vma.size, prot, vma.offset)
+                self.__mappings_to_load[vma.start] = (self.__filename, vma.size, prot, vma.offset)
 
 
     def __load_mappings(self,
@@ -386,9 +389,7 @@ class EmuCore(object):
                 s3_path = s3path.S3Path.from_uri(mapped_filenames[fn])
                 size = self.__s3.head_object(Bucket=s3_path.bucket, Key=s3_path.key)['ContentLength']
 
-                print(f'Loading {fn} from {mapped_filenames[fn]}, size {humanize.naturalsize(size)}')
-
-                data = self.__s3.get_object(Bucket=s3_path.bucket, Key=s3_path.key)['Body'].read()
+                print(f'Would load {fn} from {mapped_filenames[fn]}, size {humanize.naturalsize(size)}')
 
                 map_tasks = []
 
@@ -396,13 +397,11 @@ class EmuCore(object):
                     # we know it's not writeable (otherwise it would be in the coredump)
                     # so make it RX (FIXME look into sections?)
                     prot = uc.UC_PROT_READ | uc.UC_PROT_EXEC
-                    assert vma.offset_end <= utils.mmapsize(len(data)), f'invalid mapping on {fn}: {vma}'
+                    assert vma.offset_end <= utils.mmapsize(size), f'invalid mapping on {fn}: {vma}'
                     map_tasks.append((vma.start, vma.size, prot, vma.offset))
 
                 for start, size, prot, offset in map_tasks:
-                    self.emu.mem_map(start, size, prot)
-                    self.emu.mem_write(start, data[offset:offset+size])
-                    self.__loaded_mappings[start] = size
+                    self.__mappings_to_load[start] = (mapped_filenames[fn], size, prot, offset)
 
             except:
                 print(f'Skipping {fn}')
@@ -486,14 +485,14 @@ class EmuCore(object):
             print(f'Loading {load_symbols}, size {humanize.naturalsize(size)}')
             self.__symbols_data = io.BytesIO(self.__s3.get_object(Bucket=s3_path.bucket, Key=s3_path.key)['Body'].read())
 
-            self.__symbols = elffile.ELFFile(self.__symbols_data)
+            self.__symbols = elftools.elf.elffile.ELFFile(self.__symbols_data)
             assert self.__symbols['e_ident']['EI_OSABI'] in {'ELFOSABI_SYSV', 'ELFOSABI_LINUX'}
             assert self.__symbols['e_machine'] == 'EM_X86_64'
             assert self.__symbols['e_type'] == 'ET_EXEC'
 
             # Parse coredump notes
             segs = self.__symbols.iter_segments()
-            note_segs = filter(lambda seg: isinstance(seg, elffile.NoteSegment), segs)
+            note_segs = filter(lambda seg: isinstance(seg, elftools.elf.elffile.NoteSegment), segs)
             notes = [n for seg in note_segs for n in seg.iter_notes()]
 
             # process
@@ -576,9 +575,9 @@ class EmuCore(object):
         
         # Try to parse its symbols
         try:
-            elf = elffile.ELFFile(stream)
+            elf = elftools.elf.elffile.ELFFile(stream)
             for table in elf.iter_sections():
-                if not isinstance(table, sections.SymbolTableSection):
+                if not isinstance(table, elftools.elf.sections.SymbolTableSection):
                     continue
                 for sym in table.iter_symbols():
                     sym = Symbol.load(obj, sym)
@@ -760,18 +759,32 @@ class EmuCore(object):
         access_type, cause = UC_MEM_TYPES[htype]
         faddr = self.format_code_addr(addr)
         text = f'{access_type.lower()} of {size} bytes at {faddr}'
+
         if cause == 'PROT':
             raise self.__emulation_error(f'{text}, which is protected')
+
         if cause == 'UNMAPPED':
             if self.load_address_if_needed(addr):
                 return True
+
+            rip = self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RIP)
+            code = self.emu.mem_read(rip, 64)
+            iced = iced_x86.Decoder(64, code, ip=rip)
+            for instr in iced:
+                bytes_str = code[instr.ip-rip:instr.ip-rip+instr.len].hex().upper()
+                print(f'{instr.ip:016X} {bytes_str:20} {instr:n}')
+
             try:
                 fname, vma = self.find_mapping(addr)
+
             except ValueError:
                 raise self.__emulation_error(f'{text}, which is invalid') from None
+
             assert fname not in self.mappings_mm
+
             raise self.__emulation_error(
                 f'{text}, which belongs to a file that was skipped or failed to load')
+
 
     def __hook_insn_invalid(self):
         raise self.__emulation_error('invalid instruction')
@@ -789,7 +802,7 @@ class EmuCore(object):
         if not (handler := getattr(self, '_syscall_' + nr.name, None)):
             raise self.__emulation_error(f'"{nr.name}" syscall')
         nparams = len(inspect.signature(handler).parameters)
-        result = handler(*( self.emu.reg_read(r) for r in SYSV_AMD_ARG_REGS[:nparams] ))
+        result = handler(*(self.emu.reg_read(r) for r in SYSV_AMD_ARG_REGS[:nparams]))
         if isinstance(result, Errno):
             result = -result.value
         else:

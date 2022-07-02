@@ -1,5 +1,6 @@
 boto3
 humanize
+iced-x86
 pyelftools
 s3path
 sortedcontainers
