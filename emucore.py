@@ -1,5 +1,4 @@
 from typing import Callable, Literal, Optional, Union
-from unicorn.unicorn import uc, x86_const
 
 from utils import read_struct, write_struct, read_bstr, read_str, write_str, \
     sort_and_ensure_disjoint, VMA, \
@@ -217,11 +216,11 @@ class EmuCore(object):
         self.auxv = parse_auxv_note(next((n for n in notes if n['n_type'] == 'NT_AUXV')))
 
         # Initialize emulator instance
-        self.emu = unicorn.Uc(uc.UC_ARCH_X86, uc.UC_MODE_64)
+        self.emu = unicorn.Uc(unicorn.unicorn.uc.UC_ARCH_X86, unicorn.unicorn.uc.UC_MODE_64)
 
         # restore FS and GS from a random thread (userspace typically
         # stores TCB in FS, any TLS-related stuff will fail if not initialized)
-        for reg in {x86_const.UC_X86_REG_FS_BASE, x86_const.UC_X86_REG_GS_BASE}:
+        for reg in {unicorn.unicorn.x86_const.UC_X86_REG_FS_BASE, unicorn.unicorn.x86_const.UC_X86_REG_GS_BASE}:
             self.emu.reg_write(reg, self.threads[0].regs[reg])
 
         # save clean context
@@ -229,11 +228,11 @@ class EmuCore(object):
 
         # register hooks
         hooks = [
-            (uc.UC_HOOK_MEM_INVALID, self.__hook_mem),
-            (uc.UC_HOOK_INSN_INVALID, self.__hook_insn_invalid),
-            (uc.UC_HOOK_INTR, self.__hook_intr),
-            (uc.UC_HOOK_INSN, lambda: self.__hook_intr('syscall'), x86_const.UC_X86_INS_SYSCALL),
-            (uc.UC_HOOK_INSN, lambda: self.__hook_intr('sysenter'), x86_const.UC_X86_INS_SYSENTER),
+            (unicorn.unicorn.uc.UC_HOOK_MEM_INVALID, self.__hook_mem),
+            (unicorn.unicorn.uc.UC_HOOK_INSN_INVALID, self.__hook_insn_invalid),
+            (unicorn.unicorn.uc.UC_HOOK_INTR, self.__hook_intr),
+            (unicorn.unicorn.uc.UC_HOOK_INSN, lambda: self.__hook_intr('syscall'), unicorn.unicorn.x86_const.UC_X86_INS_SYSCALL),
+            (unicorn.unicorn.uc.UC_HOOK_INSN, lambda: self.__hook_intr('sysenter'), unicorn.unicorn.x86_const.UC_X86_INS_SYSENTER),
         ]
         for hook, cb, *args in hooks:
             self.emu.hook_add(hook, (lambda cb: lambda *args: cb(*args[1:-1]))(cb), None, 1, 0, *args)
@@ -248,7 +247,7 @@ class EmuCore(object):
         if (pagesize := self.auxv[AuxvField.PAGESZ.value]) != mmap.PAGESIZE:
             logger.warn(f'coredump page size ({pagesize}) differs from host ({mmap.PAGESIZE})')
 
-        assert self.emu.query(uc.UC_QUERY_PAGE_SIZE) <= mmap.PAGESIZE
+        assert self.emu.query(unicorn.unicorn.uc.UC_QUERY_PAGE_SIZE) <= mmap.PAGESIZE
         # (first core segments, then RO mappings over any uncovered areas)
         self.__load_core_segments()
         self.__load_mappings(**mapping_load_kwargs)
@@ -267,7 +266,7 @@ class EmuCore(object):
         # Map our stack area
         self.stack_addr, self.stack_size = stack_addr, stack_size
         self.stack_base = stack_addr - stack_size
-        self.emu.mem_map(self.stack_base, self.stack_size, uc.UC_PROT_ALL)
+        self.emu.mem_map(self.stack_base, self.stack_size, unicorn.unicorn.uc.UC_PROT_ALL)
 
 
     def load_address_if_needed(self, address):
@@ -294,13 +293,17 @@ class EmuCore(object):
                     self.__mappings_to_load[to_map_address] = (module, start_address-to_map_address, prot, offset)
                     if to_map_address + size - start_address >= 1024*1024:
                         self.__mappings_to_load[start_address+1024*1024] = (module, to_map_address+size-start_address-1024*1024, prot, offset+start_address+1024*1024-to_map_address)
-                    size = 1024*1024
+                        size = 1024*1024
+                    else:
+                        size = size+to_map_address-start_address
+
                     offset = offset+start_address-to_map_address
 
                 print(f'Loading {hex(start_address)}..{hex(start_address+size)} from {module}, size {humanize.naturalsize(size)}')
 
                 s3_path = s3path.S3Path.from_uri(module)
                 data = self.__s3.get_object(Bucket=s3_path.bucket, Key=s3_path.key, Range=f'bytes={offset}-{offset+size-1}')['Body'].read()
+
                 self.emu.mem_map(start_address, size, prot)
                 self.emu.mem_write(start_address, data)
                 self.__loaded_mappings[start_address] = size
@@ -320,8 +323,11 @@ class EmuCore(object):
 
         for vma, flags in load_segs:
             prot = elf_flags_to_uc_prot(flags)
-            if vma.offset_end > utils.mmapsize(self.__size):
-                print(f'Segment {hex(vma.start)}-{hex(vma.start+vma.size)} exceeds file size, looks like the core dump is truncated.')
+            if vma.offset >= utils.mmapsize(self.__size):
+                print(f'Segment {hex(vma.start)}-{hex(vma.start+vma.size)} is outside of file boundaries, looks like the core dump is truncated.')
+            elif vma.offset_end > utils.mmapsize(self.__size):
+                print(f'Segment {hex(vma.start)}-{hex(vma.start+vma.size)} intersects file boundaries, looks like the core dump is truncated.')
+                self.__mappings_to_load[vma.start] = (self.__filename, self.__size-vma.offset, prot, vma.offset)
             else:
                 self.__mappings_to_load[vma.start] = (self.__filename, vma.size, prot, vma.offset)
 
@@ -396,7 +402,7 @@ class EmuCore(object):
                 for vma in vmas:
                     # we know it's not writeable (otherwise it would be in the coredump)
                     # so make it RX (FIXME look into sections?)
-                    prot = uc.UC_PROT_READ | uc.UC_PROT_EXEC
+                    prot = unicorn.unicorn.uc.UC_PROT_READ | unicorn.unicorn.uc.UC_PROT_EXEC
                     assert vma.offset_end <= utils.mmapsize(size), f'invalid mapping on {fn}: {vma}'
                     map_tasks.append((vma.start, vma.size, prot, vma.offset))
 
@@ -746,8 +752,8 @@ class EmuCore(object):
         as formatted text. Used for errors.'''
         tracer = self.stack_tracer
         trace = ([] if tracer is None else list(tracer.entries)) + [(
-            self.emu.reg_read(x86_const.UC_X86_REG_RSP),
-            self.emu.reg_read(x86_const.UC_X86_REG_RIP),
+            self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RSP),
+            self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RIP),
         )]
         format_call = lambda sp, ip: f'  at {self.format_code_addr(ip)}, sp={sp:#x}'
         return '\n'.join(format_call(*c) for c in trace)
@@ -793,7 +799,7 @@ class EmuCore(object):
         if intno != 'syscall': # FIXME: x86-32
             raise self.__emulation_error(f'invalid interrupt {intno}')
 
-        nr = self.emu.reg_read(x86_const.UC_X86_REG_RAX)
+        nr = self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RAX)
         try:
             nr = SyscallX64(nr)
         except ValueError as e:
@@ -807,7 +813,7 @@ class EmuCore(object):
             result = -result.value
         else:
             assert isinstance(result, int) and result >= 0
-        self.emu.reg_write(x86_const.UC_X86_REG_RAX, result)
+        self.emu.reg_write(unicorn.unicorn.x86_const.UC_X86_REG_RAX, result)
 
     # FIXME: implement more archs and calling conventions
     def call(
@@ -853,12 +859,12 @@ class EmuCore(object):
         # emulate!
         with self.reserve(len(stack_args), align=16) as mem:
             mem.write(stack_args)
-            emu.reg_write(x86_const.UC_X86_REG_RSP, mem.start)
+            emu.reg_write(unicorn.unicorn.x86_const.UC_X86_REG_RSP, mem.start)
             emu.emu_start(func, ret_addr, time_limit, instruction_limit)
-            if emu.reg_read(x86_const.UC_X86_REG_RIP) != ret_addr:
+            if emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RIP) != ret_addr:
                 raise self.__emulation_error(f'Instruction/time limit exhausted')
-            assert emu.reg_read(x86_const.UC_X86_REG_RSP) == mem.start + 8
-            return emu.reg_read(x86_const.UC_X86_REG_RAX)
+            assert emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RSP) == mem.start + 8
+            return emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RAX)
 
     # SYSCALLS
 
