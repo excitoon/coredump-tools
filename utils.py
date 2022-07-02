@@ -4,7 +4,7 @@ and other low level stuff.
 '''
 
 import enum
-from io import SEEK_CUR, SEEK_END, SEEK_SET, BytesIO, RawIOBase, UnsupportedOperation
+from io import SEEK_CUR, SEEK_END, SEEK_SET, RawIOBase, UnsupportedOperation
 import itertools
 import mmap
 import struct
@@ -17,8 +17,11 @@ from unicorn.unicorn import uc, Uc, x86_const
 from elftools.elf.constants import P_FLAGS
 from dataclasses import dataclass
 
+import io
+
 # get real size of mmap'ed region, i.e. rounding up by PAGESIZE
-mmapsize = lambda mm: ((mm.size() - 1) // mmap.PAGESIZE + 1) * mmap.PAGESIZE
+mmapsize = lambda s: ((s - 1) // mmap.PAGESIZE + 1) * mmap.PAGESIZE
+mmapalign = lambda s: (s // mmap.PAGESIZE) * mmap.PAGESIZE
 
 def try_enum(cls, x):
     try:
@@ -61,17 +64,19 @@ def write_str(
 
 class UnicornIO(RawIOBase):
     '''Exposes (part of) the memory of a Unicorn engine as a raw I/O stream'''
+
     uc: Uc
     start: int
     size: int
     offset: int
 
-    def __init__(self, uc: Uc, start: int=0, size: Optional[int]=None, offset: int=0):
+    def __init__(self, emucore, start: int=0, size: Optional[int]=None, offset: int=0):
         if size is None:
             size = (1 << 64) - start
         assert 0 <= start <= (1 << 64)
         assert 0 <= size <= (1 << 64) - start
-        self.uc, self.start, self.size, self.offset = uc, start, size, 0
+        self.__emucore = emucore
+        self.uc, self.start, self.size, self.offset = emucore.emu, start, size, 0
         self.seek(offset)
 
     def readable(self):
@@ -102,6 +107,9 @@ class UnicornIO(RawIOBase):
         size = max_size if size == -1 else min(size, max_size)
         addr = self.start + self.offset
         assert 0 <= size < (1 << 64) and 0 <= addr < (1 << 64)
+
+        self.__emucore.load_address_if_needed(addr)
+
         result = self.uc.mem_read(addr, size)
         self.offset += size
         return result
@@ -275,8 +283,7 @@ class Prstatus(object):
 
     @staticmethod
     def load(note):
-        # pyelftools gives rawdata as a 'string', convert back to bytes
-        st = BytesIO(note['n_descdata'].encode('latin-1'))
+        st = io.BytesIO(note['n_descdata'])
 
         # parse common data
         common = read_struct(st, '<' + '3i' + 'h2x' + 'QQ' + '4I')
@@ -296,8 +303,7 @@ class Prstatus(object):
         return Prstatus(*common, *times, regs, pr_fpvalid)
 
 def parse_auxv_note(note):
-    # pyelftools gives rawdata as a 'string', convert back to bytes
-    st = BytesIO(note['n_descdata'].encode('latin-1'))
+    st = io.BytesIO(note['n_descdata'])
     result = []
     while (pair := read_struct(st, '<2Q'))[0]: result.append(pair)
     rdict = dict(result)

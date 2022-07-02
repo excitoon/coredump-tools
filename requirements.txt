@@ -1,0 +1,6 @@
+boto3
+humanize
+pyelftools
+s3path
+sortedcontainers
+unicorn

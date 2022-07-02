@@ -1,31 +1,36 @@
-"""
-Main module, exposes public API
-"""
-
-from inspect import signature
-import logging
-import re
-from collections import defaultdict
-import ctypes
-from io import DEFAULT_BUFFER_SIZE, BufferedRandom, BytesIO
-import os
 from typing import Callable, Literal, Optional, Union
-from unicorn.unicorn import Uc, UcContext, UcError, uc, x86_const
+from unicorn.unicorn import UcContext, UcError, uc, x86_const
 from elftools.elf import elffile, sections
-import mmap
-import struct
-import bisect
-from contextlib import contextmanager
 
-from .utils import \
-    UnicornIO, read_struct, write_struct, read_bstr, read_str, write_str, \
+from utils import read_struct, write_struct, read_bstr, read_str, write_str, \
     sort_and_ensure_disjoint, VMA, \
     parse_load_segments, parse_file_note, Prstatus, FileMapping, \
     parse_auxv_note, AuxvField, \
-    parse_program_header, parse_dynamic_section, RtState, RtLoadedObject, Symbol, \
-    mmapsize, elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS, UC_MEM_TYPES
+    parse_dynamic_section, RtState, RtLoadedObject, Symbol, \
+    elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS, UC_MEM_TYPES
 
-from .syscall import SyscallX64, Errno, FutexCmd, FutexOp
+from syscall import SyscallX64, Errno, FutexCmd, FutexOp
+
+import bisect
+import collections
+import contextlib
+import ctypes
+import inspect
+import io
+import logging
+import mmap
+import os
+import re
+import struct
+
+import boto3
+import humanize
+import s3path
+import sortedcontainers
+import unicorn
+
+import utils
+
 
 __all__ = ['EmuCore', 'EmulationError']
 
@@ -34,16 +39,19 @@ logger = logging.getLogger(__name__)
 # try to load stack tracing module
 tracer_exc = None
 try:
-    from .tracer.binding import StackTracer
+    from tracer.binding import StackTracer
 except ImportError as e:
     tracer_exc = e
 tracer_exc_logged = False
+
+
 def is_stack_tracer_available():
     global tracer_exc_logged
     if not (tracer_exc is None) and not tracer_exc_logged:
         logger.warn('stack tracing requested but not available, disabling...', exc_info=tracer_exc)
         tracer_exc_logged = True
     return tracer_exc is None
+
 
 # FIXME: a lot of these asserts should be exceptions, we should have a class
 # FIXME: proper log system
@@ -99,7 +107,7 @@ class EmuCore(object):
     '''
 
     # open resources (FIXME: make this class a context manager)
-    emu: Uc
+    emu: unicorn.Uc
     stack_tracer: 'StackTracer'
     core: elffile.ELFFile
     core_mm: mmap.mmap
@@ -171,38 +179,52 @@ class EmuCore(object):
             reconstruct a sort of call stack. pass the desired capacity (maximum
             entries) or 0 to disable the stack tracer (default: 150)
         '''
+
+        self.__mappings_to_load = sortedcontainers.SortedDict()
+        self.__loaded_mappings = sortedcontainers.SortedDict()
+
         # Start by opening the core file
-        self.core = elffile.ELFFile(open(filename, 'rb'))
-        assert self.core['e_ident']['EI_OSABI'] in {'ELFOSABI_SYSV', 'ELFOSABI_LINUX'}, \
-            'only Linux supported'
+        self.__s3 = boto3.client('s3')
+        self.__s3_path = s3path.S3Path.from_uri(filename)
+        self.__size = self.__s3.head_object(Bucket=self.__s3_path.bucket, Key=self.__s3_path.key)['ContentLength']
+
+        size = 10*1024*1024
+        print(f'Loading header, size {humanize.naturalsize(size)}')
+        self.__header = io.BytesIO(self.__s3.get_object(Bucket=self.__s3_path.bucket, Key=self.__s3_path.key, Range=f'bytes=0-{size-1}')['Body'].read())
+
+        self.core = elffile.ELFFile(self.__header)
+        assert self.core['e_ident']['EI_OSABI'] in {'ELFOSABI_SYSV', 'ELFOSABI_LINUX'}, 'only Linux supported'
         assert self.core['e_machine'] == 'EM_X86_64', 'only x86-64 supported'
         assert self.core['e_type'] == 'ET_CORE', 'not a core file'
 
         # Parse coredump notes
         segs = self.core.iter_segments()
         note_segs = filter(lambda seg: isinstance(seg, elffile.NoteSegment), segs)
-        notes = [ n for seg in note_segs for n in seg.iter_notes() ]
+        notes = [n for seg in note_segs for n in seg.iter_notes()]
+
         # files
-        file_note = next(n['n_desc'] for n in notes if n['n_type'] == 'NT_FILE')
-        self.mappings = sort_and_ensure_disjoint(
-            parse_file_note(file_note), lambda x: x[1])
-        self.mappings__keys = [ vma.start for _, vma in self.mappings ]
+        file_note = next((n['n_desc'] for n in notes if n['n_type'] == 'NT_FILE'))
+        self.mappings = sort_and_ensure_disjoint(parse_file_note(file_note), lambda x: x[1])
+        self.mappings__keys = [vma.start for _, vma in self.mappings]
+
         # threads
-        self.threads = list(map(Prstatus.load,
-            filter(lambda n: n['n_type'] == 'NT_PRSTATUS', notes)))
+        self.threads = list(map(Prstatus.load, filter(lambda n: n['n_type'] == 'NT_PRSTATUS', notes)))
+
         # process
         # FIXME: parse PRPSINFO
-        self.auxv = parse_auxv_note(
-            next( n for n in notes if n['n_type'] == 'NT_AUXV' ))
+        self.auxv = parse_auxv_note(next((n for n in notes if n['n_type'] == 'NT_AUXV')))
 
         # Initialize emulator instance
-        self.emu = Uc(uc.UC_ARCH_X86, uc.UC_MODE_64)
+        self.emu = unicorn.Uc(uc.UC_ARCH_X86, uc.UC_MODE_64)
+
         # restore FS and GS from a random thread (userspace typically
         # stores TCB in FS, any TLS-related stuff will fail if not initialized)
         for reg in {x86_const.UC_X86_REG_FS_BASE, x86_const.UC_X86_REG_GS_BASE}:
             self.emu.reg_write(reg, self.threads[0].regs[reg])
+
         # save clean context
         self.emu_ctx = self.emu.context_save()
+
         # register hooks
         hooks = [
             (uc.UC_HOOK_MEM_INVALID, self.__hook_mem),
@@ -213,6 +235,7 @@ class EmuCore(object):
         ]
         for hook, cb, *args in hooks:
             self.emu.hook_add(hook, (lambda cb: lambda *args: cb(*args[1:-1]))(cb), None, 1, 0, *args)
+
         # setup stack tracer
         self.stack_tracer = None
         if trace_stack and is_stack_tracer_available():
@@ -222,37 +245,83 @@ class EmuCore(object):
         # Map everything into emulator
         if (pagesize := self.auxv[AuxvField.PAGESZ.value]) != mmap.PAGESIZE:
             logger.warn(f'coredump page size ({pagesize}) differs from host ({mmap.PAGESIZE})')
+
         assert self.emu.query(uc.UC_QUERY_PAGE_SIZE) <= mmap.PAGESIZE
         # (first core segments, then RO mappings over any uncovered areas)
         self.__load_core_segments()
         self.__load_mappings(**mapping_load_kwargs)
 
         # Load symbols from binary and loaded objects
-        if load_symbols: self.__load_symbols()
+        if load_symbols:
+            self.__load_symbols(load_symbols)
 
         # Post-load fixups
         logger.info('Performing fixups...')
-        if patch_glibc: self.__patch_glibc()
-        if patch_lock: self.__patch_pthreads()
+        if patch_glibc:
+            self.__patch_glibc()
+        if patch_lock:
+            self.__patch_pthreads()
 
         # Map our stack area
         self.stack_addr, self.stack_size = stack_addr, stack_size
         self.stack_base = stack_addr - stack_size
         self.emu.mem_map(self.stack_base, self.stack_size, uc.UC_PROT_ALL)
 
+
+    def load_address_if_needed(self, address):
+        try:
+            mapping_address = next(self.__loaded_mappings.irange(maximum=address, reverse=True))
+            assert mapping_address + self.__loaded_mappings[mapping_address] > address
+            return False
+
+        except:
+            try:
+                to_map_address = next(self.__mappings_to_load.irange(maximum=address, reverse=True))
+            except:
+                return False
+
+            size, prot, offset = self.__mappings_to_load[to_map_address]
+            if to_map_address + size > address:
+                self.__mappings_to_load.pop(to_map_address)
+
+                if size <= 1024*1024:
+                    start_address = to_map_address
+
+                else:
+                    start_address = utils.mmapalign(address)
+                    self.__mappings_to_load[to_map_address] = (start_address-to_map_address, prot, offset)
+                    if to_map_address + size - start_address >= 1024*1024:
+                        self.__mappings_to_load[start_address+1024*1024] = (to_map_address+size-start_address-1024*1024, prot, offset+start_address+1024*1024-to_map_address)
+                    size = 1024*1024
+                    offset = start_address-to_map_address
+
+                print(f'Loading {hex(start_address)}..{hex(start_address+size)}, size {humanize.naturalsize(size)}')
+
+                data = self.__s3.get_object(Bucket=self.__s3_path.bucket, Key=self.__s3_path.key, Range=f'bytes={offset}-{offset+size-1}')['Body'].read()
+                self.emu.mem_map(start_address, size, prot)
+                self.emu.mem_write(start_address, data)
+                self.__loaded_mappings[start_address] = size
+                return True
+
+            else:
+                return False
+
+
     # MEMORY MAPPING
 
     def __load_core_segments(self):
         '''Read LOAD segments from core and map them'''
+
         load_segs = parse_load_segments(self.core)
-        logger.info(f'Mapping {len(load_segs)} LOAD segments...')
-        corefd = self.core.stream.fileno()
-        self.core_mm = mm = mmap.mmap(corefd, 0, mmap.MAP_PRIVATE, REQUIRED_PROT)
+        logger.info(f'Would map {len(load_segs)} LOAD segments, total size {sum((vma.size for vma, _ in load_segs))}...')
+
         for vma, flags in load_segs:
             prot = elf_flags_to_uc_prot(flags)
-            assert vma.offset_end <= mmapsize(mm), 'segment exceeds file, malformed ELF'
-            ptr = ctypes.byref((ctypes.c_char*1).from_buffer(mm, vma.offset))
-            self.emu.mem_map_ptr(vma.start, vma.size, prot, ptr)
+            if vma.offset_end > utils.mmapsize(self.__size):
+                print(f'Segment {hex(vma.start)}-{hex(vma.start+vma.size)} exceeds file size, looks like the core dump is truncated.')
+            else:
+                self.__mappings_to_load[vma.start] = (vma.size, prot, vma.offset)
+
 
     def __load_mappings(self,
         whitelist: list[Union[str, bytes]]=[],
@@ -275,9 +344,6 @@ class EmuCore(object):
         filename and must return the filename to access on disk, or None to skip the file.
         '''
         ensure_bytes = lambda x: x.encode() if isinstance(x, str) else x
-        blacklist = list(map(ensure_bytes, blacklist))
-        whitelist = list(map(ensure_bytes, whitelist))
-        filename_map = (lambda o: lambda fn: ensure_bytes(o(fn)))(filename_map)
 
         # remove mappings that overlap with already loaded regions
         regions = sort_and_ensure_disjoint((s, e+1) for s, e, _ in self.emu.mem_regions())
@@ -294,49 +360,55 @@ class EmuCore(object):
 
         # collect simplified mappings for each file
         # (note that we keep all files, even if they no longer have VMAs)
-        file_mappings: dict[bytes, list[VMA]] = { fn: [] for fn, _ in self.mappings }
+        file_mappings: dict[bytes, list[VMA]] = { fn.decode(): [] for fn, _ in self.mappings }
         for fname, vma in mappings:
-            file_mappings[fname].append(vma)
+            file_mappings[fname.decode()].append(vma)
         file_mappings = { k: VMA.simplify(v) for k, v in file_mappings.items() }
 
         # filter / transform files according to settings
-        is_invalid = lambda fn: \
-            fn.startswith(b'anon_inode:') or fn.startswith(b'/memfd:') or fn.endswith(b' (deleted)')
-        is_special = lambda fn: \
-            (fn := filename_map(fn)) != None and os.path.exists(fn) and not os.path.isfile(fn)
+        is_invalid = lambda fn: fn.startswith('anon_inode:') or fn.startswith('/memfd:') or fn.endswith(' (deleted)')
+        is_special = lambda fn: (fn := filename_map(fn)) != None and os.path.exists(fn) and not os.path.isfile(fn)
         file_skipped = lambda fn: \
             (skip_invalid and is_invalid(fn)) or (skip_special and is_special(fn)) \
             or any(fn.startswith(pref) for pref in blacklist)
-        file_filter = lambda fn: \
-            any(fn.startswith(pref) for pref in whitelist) or not file_skipped(fn)
-        mapped_filenames = { fn: fn2 for fn in file_mappings
-            if file_filter(fn) and (fn2 := filename_map(fn)) != None }
+        file_filter = lambda fn: any(fn.startswith(pref) for pref in whitelist) or not file_skipped(fn)
+        mapped_filenames = { fn: fn2 for fn in file_mappings if file_filter(fn) and (fn2 := filename_map(fn)) != None }
 
-        skipped_with_vmas = [ fn for fn, vmas in file_mappings.items()
-            if fn not in mapped_filenames and vmas ]
+        skipped_with_vmas = [ fn for fn, vmas in file_mappings.items() if fn not in mapped_filenames and vmas ]
         if skipped_with_vmas:
-            logger.info('Skipped files with VMAs:\n{}'.format('\n'.join(
-                f' - {fn.decode(errors="replace")}' for fn in skipped_with_vmas )))
+            logger.info('Skipped files with VMAs:\n{}'.format('\n'.join(f' - {fn}' for fn in skipped_with_vmas )))
         file_mappings = { fn: v for fn, v in file_mappings.items() if fn in mapped_filenames }
         total_mappings = sum(len(v) for v in file_mappings.values())
         logger.info(f'Mapping {len(file_mappings)} files, {total_mappings} VMAs...')
 
-        # map files (FIXME: catch open() errors and move on)
-        self.mappings_mm = {}
         for fn, vmas in file_mappings.items():
-            with open(mapped_filenames[fn], 'rb') as f:
-                mm = mmap.mmap(f.fileno(), 0, mmap.MAP_PRIVATE, REQUIRED_PROT)
-                self.mappings_mm[fn] = (mapped_filenames[fn], mm)
-            for vma in vmas:
-                # we know it's not writeable (otherwise it would be in the coredump)
-                # so make it RX (FIXME look into sections?)
-                prot = uc.UC_PROT_READ | uc.UC_PROT_EXEC
-                assert vma.offset_end <= mmapsize(mm), \
-                    f'invalid mapping on {fn}: {vma}'
-                ptr = ctypes.byref((ctypes.c_char*1).from_buffer(mm, vma.offset))
-                self.emu.mem_map_ptr(vma.start, vma.size, prot, ptr)
+            try:
+                s3_path = s3path.S3Path.from_uri(mapped_filenames[fn])
+                size = self.__s3.head_object(Bucket=s3_path.bucket, Key=s3_path.key)['ContentLength']
 
-    def mem(self, start: Union[int, str]=0, size: Optional[int]=None, offset: int=0, buffer_size: int=DEFAULT_BUFFER_SIZE):
+                print(f'Loading {fn} from {mapped_filenames[fn]}, size {humanize.naturalsize(size)}')
+
+                data = self.__s3.get_object(Bucket=s3_path.bucket, Key=s3_path.key)['Body'].read()
+
+                map_tasks = []
+
+                for vma in vmas:
+                    # we know it's not writeable (otherwise it would be in the coredump)
+                    # so make it RX (FIXME look into sections?)
+                    prot = uc.UC_PROT_READ | uc.UC_PROT_EXEC
+                    assert vma.offset_end <= utils.mmapsize(len(data)), f'invalid mapping on {fn}: {vma}'
+                    map_tasks.append((vma.start, vma.size, prot, vma.offset))
+
+                for start, size, prot, offset in map_tasks:
+                    self.emu.mem_map(start, size, prot)
+                    self.emu.mem_write(start, data[offset:offset+size])
+                    self.__loaded_mappings[start] = size
+
+            except:
+                print(f'Skipping {fn}')
+                continue
+
+    def mem(self, start: Union[int, str]=0, size: Optional[int]=None, offset: int=0, buffer_size: int=io.DEFAULT_BUFFER_SIZE):
         '''Returns a binary I/O stream over (a region of) memory
 
         First two arguments restrict the accessible memory range,
@@ -352,7 +424,7 @@ class EmuCore(object):
             if not (syms := self.get_symbols(start, stype=Symbol.Type.OBJECT)):
                 raise ValueError(f'no OBJECT symbol found for {start}')
             start, size = syms[0].addr, syms[0].size
-        stream = UnicornIO(self.emu, start, size, offset)
+        stream = utils.UnicornIO(self, start, size, offset)
         # FIXME: BufferedRandom fails with some obscure exception from native code...
         #stream = BufferedRandom(stream, buffer_size) if buffer_size > 0 else stream
         # inject convenience methods (FIXME: more elegant way?)
@@ -363,7 +435,7 @@ class EmuCore(object):
         stream.write_str = lambda *args, **kwargs: write_str(stream, *args, **kwargs)
         return stream
 
-    @contextmanager
+    @contextlib.contextmanager
     def reserve(self, size: int, align=8):
         '''Returns a context manager object that allocates memory on our stack area.
 
@@ -401,10 +473,39 @@ class EmuCore(object):
             return self.mappings[idx-1]
         raise ValueError(f'address {addr:#x} not mapped')
 
+
     # SYMBOLS
 
-    def __load_symbols(self):
+    def __load_symbols(self, load_symbols):
         '''Find info about loaded objects and load their symbols'''
+
+        if isinstance(load_symbols, str):
+            s3_path = s3path.S3Path.from_uri(load_symbols)
+            size = self.__s3.head_object(Bucket=s3_path.bucket, Key=s3_path.key)['ContentLength']
+
+            print(f'Loading {load_symbols}, size {humanize.naturalsize(size)}')
+            self.__symbols_data = io.BytesIO(self.__s3.get_object(Bucket=s3_path.bucket, Key=s3_path.key)['Body'].read())
+
+            self.__symbols = elffile.ELFFile(self.__symbols_data)
+            assert self.__symbols['e_ident']['EI_OSABI'] in {'ELFOSABI_SYSV', 'ELFOSABI_LINUX'}
+            assert self.__symbols['e_machine'] == 'EM_X86_64'
+            assert self.__symbols['e_type'] == 'ET_EXEC'
+
+            # Parse coredump notes
+            segs = self.__symbols.iter_segments()
+            note_segs = filter(lambda seg: isinstance(seg, elffile.NoteSegment), segs)
+            notes = [n for seg in note_segs for n in seg.iter_notes()]
+
+            # process
+            # FIXME: parse PRPSINFO
+            auxv = parse_auxv_note(next((n for n in notes if n['n_type'] == 'NT_AUXV')))
+
+            elf = self.__symbols
+
+        else:
+            auxv = self.auxv
+            elf = self.core
+
         # First we need to parse the binary ELF. This is essential;
         # without this we can't use the "debugger interface" to find
         # the rest of the objects, so no symbols at all.
@@ -412,18 +513,19 @@ class EmuCore(object):
         # Use auxv to locate program header of main executable, parse them
         # (we are using the raw structs here and not ELFFile, because this is
         # not the ELF file as seen on disk but its loaded version)
-        phdr_base = self.auxv[AuxvField.PHDR.value]
-        phdr_num = self.auxv[AuxvField.PHNUM.value]
-        phdr = parse_program_header(self.core.structs, self.mem(phdr_base), phdr_num)
+        phdr_base = auxv[AuxvField.PHDR.value]
+        phdr_num = auxv[AuxvField.PHNUM.value]
+        phdr = utils.parse_program_header(elf.structs, self.mem(phdr_base)#FIXME???
+, phdr_num)
         # FIXME: use VMAs to locate base of executable, we'll need it to translate vaddrs, how tf does ld do it??
         _, vma = self.find_mapping(phdr_base)
         main_base = vma.start - vma.offset
 
         # Find r_debug (debugger interface entry point) through the DT_DEBUG tag
         try:
-            dyn_seg = next(seg['p_vaddr'] for seg in phdr if seg['p_type'] == 'PT_DYNAMIC')
-            dt_debug = next(parse_dynamic_section(self.core.structs,
-                self.mem(main_base + dyn_seg), 'DT_DEBUG'))['d_ptr']
+            dyn_seg = next((seg['p_vaddr'] for seg in phdr if seg['p_type'] == 'PT_DYNAMIC'))
+            dt_debug = next(parse_dynamic_section(elf.structs, self.mem(main_base + dyn_seg), 'DT_DEBUG'))['d_ptr']
+
         except StopIteration:
             logger.warn('cannot find DT_DEBUG tag in binary. either it is a '
                 'statically linked executable or it does not conform to the debugger '
@@ -432,41 +534,41 @@ class EmuCore(object):
             # have a PT_DYNAMIC segment and maybe fall back to loading symbol table
             # by looking through the sections instead of the dynamic segment
             return
+
         if not dt_debug:
-            logger.warn('DT_DEBUG tag not initialized. either linker does not '
-                'follow debugger interface or who knows')
+            logger.warn('DT_DEBUG tag not initialized. either linker does not follow debugger interface or who knows')
             return
 
         # Parse debug interface data
         r_version, r_map, r_brk, r_state, r_ldbase = self.mem(dt_debug).read_struct('<i4xQQi4xQ')
         if r_version != 1:
-            logger.warn(f'unexpected/unsupported debugger interface version {r_version}. '
-                'will try to parse anyway...')
+            logger.warn(f'unexpected/unsupported debugger interface version {r_version}. will try to parse anyway...')
         if r_state != RtState.CONSISTENT.value:
-            logger.warn('coredump was taken when loaded objects list was in '
-                'an unconsistent state. will try to parse anyway...')
+            logger.warn('coredump was taken when loaded objects list was in an unconsistent state. will try to parse anyway...')
         self.loaded_objects = list(RtLoadedObject.iterate(self.mem(), r_map))
 
         # Actually load the symbols of each object
         logger.info(f'Loading symbols for {len(self.loaded_objects)} objects...')
-        self.symbols = defaultdict(lambda: set())
-        by_addr = defaultdict(lambda: defaultdict(lambda: set()))
+        self.symbols = collections.defaultdict(lambda: set())
+        by_addr = collections.defaultdict(lambda: collections.defaultdict(lambda: set()))
         for obj in sorted(self.loaded_objects, key=lambda x: x.addr):
             self.__load_symbols_for(obj, by_addr)
         self.symbols = dict(self.symbols)
         self.symbols_by_type_by_addr = {
             stype: list(zip(*sorted(addrs.items()))) for stype, addrs in by_addr.items() }
 
+
     def __load_symbols_for(self, obj: RtLoadedObject, by_addr: dict[Symbol.Type, dict[int, list[Symbol]]]):
         # Find mapped disk file, open it
         if obj.addr != self.auxv.get(AuxvField.SYSINFO_EHDR.value):
             fname, _ = self.find_mapping(obj.ld)
             if fname not in self.mappings_mm:
-                logger.warn(f'mappings for {fname} failed or were skipped, '
-                    'its symbols will not be loaded')
+                logger.warn(f'mappings for {fname} failed or were skipped, its symbols will not be loaded')
                 return
+
             ofname, mm = self.mappings_mm[fname]
-            stream = BytesIO(mm)
+            stream = io.BytesIO(mm)
+
         else:
             # VDSO is special bc kernel doesn't insert a mapping for it,
             # but its pages are always dumped so we can read from memory
@@ -483,10 +585,13 @@ class EmuCore(object):
                     if not sym.defined: continue
                     self.symbols[sym.name].add(sym)
                     by_addr[sym.type][sym.addr].add(sym)
+
             return obj
+
         except Exception:
             logger.warn(f'failed to parse symbols from {ofname}, skipping')
             return
+
 
     def get_symbols(self, name: str,
         stype: Optional[Symbol.Type]=Symbol.Type.FUNC,
@@ -588,6 +693,7 @@ class EmuCore(object):
             asm = b'\xff\x25\x00\x00\x00\x00'
             self.mem(src).write(asm + struct.pack('<Q', target))
 
+
     def __patch_pthreads(self):
         '''We can't emulate multithreading, but we can patch mutex functions
         so that all mutexes appear unlocked and *maybe* it will work'''
@@ -605,6 +711,7 @@ class EmuCore(object):
                 logger.warn(f'failed to find {name}, skipping patch...')
             for sym in candidates:
                 self.mem(sym.addr).write(b'\x48\x31\xC0\xC3')  # xor rax, rax; ret
+
 
     # EMULATION
 
@@ -656,6 +763,8 @@ class EmuCore(object):
         if cause == 'PROT':
             raise self.__emulation_error(f'{text}, which is protected')
         if cause == 'UNMAPPED':
+            if self.load_address_if_needed(addr):
+                return True
             try:
                 fname, vma = self.find_mapping(addr)
             except ValueError:
@@ -679,7 +788,7 @@ class EmuCore(object):
 
         if not (handler := getattr(self, '_syscall_' + nr.name, None)):
             raise self.__emulation_error(f'"{nr.name}" syscall')
-        nparams = len(signature(handler).parameters)
+        nparams = len(inspect.signature(handler).parameters)
         result = handler(*( self.emu.reg_read(r) for r in SYSV_AMD_ARG_REGS[:nparams] ))
         if isinstance(result, Errno):
             result = -result.value

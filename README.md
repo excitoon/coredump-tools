@@ -1,10 +1,12 @@
-# EmuCore
+# `coredump-tools`
+
+Core dump code interpreter.
+
+Originally based on mildsunrise/emucore.
+
+## EmuCore
 
 Module that emulates function calls on a coredump.
-
-When inspecting a coredump, it is often tedious to get the desired info by parsing your way through structures. "It would be so much easier if I could just call this function", I thought. This module attempts to make that possible, within certain [limitations](#limitations).
-
-Disclaimer: This is more of a proof of concept right now and I don't anticipate having time to improve or maintain this. You've been warned.
 
 Features:
  - Simple API
@@ -16,25 +18,9 @@ Features:
 
 (*) Page size should be the same.
 
-Dependencies:
- - [Unicorn][] to emulate the CPU
- - [pyelftools][] to parse coredump and symbols
+### Examples
 
-
-## Usage
-
-Proper packaging is missing, copy the module to `site_packages` or somewhere in your path.
-
-There's a shared object (not a Python extension, just a shared object) that does the hot things such as tracing basic blocks. It's only required if you want pseudo-stacktrace support (for errors). Build with:
-
-~~~python
-make -C emucore/tracer
-~~~
-
-
-## Examples
-
-#### Realistic example: pango_font_describe
+##### Realistic example: `pango_font_describe`
 
 We want to get font descriptions from a gnome-shell corefile:
 
@@ -55,7 +41,7 @@ print(f'Font name: {get_font_description(0x555a4626b4e0)}')
 
 If we were to use `get_font_description` a lot of times, we should also free the memory afterwards.
 
-#### Parsing an int
+##### Parsing an int
 
 To emulate a call to [`strtoul`](https://linux.die.net/man/3/strtoul), we have to reserve memory for input buffer and output pointer:
 
@@ -73,7 +59,7 @@ parse_int(b'1841 and stuff')  # prints (1841, 4)
 Any coredump should work with this example, unless libc is linked statically.
 
 
-## Limitations
+### Limitations
 
  - Right now it's tied to:
 
@@ -101,9 +87,7 @@ Any coredump should work with this example, unless libc is linked statically.
    This isn't a big issue since code doesn't usually use extensions, at least not the kind of code you'd want to emulate with EmuCore. The exceptions are libc and the dynamic linker: glibc has e.g. AVX implementations for string functions. This is worked around by looking through its symbols and patching `_avx2` functions with a JMP to their `_sse2` siblings. It's reliable enough, but won't work if your libc/ld is stripped.
 
 
-## Wishlist
-
-(sorted more or less by priority)
+### Wishlist
 
  - Float function arguments
  - More archs / OSes
@@ -115,8 +99,3 @@ Any coredump should work with this example, unless libc is linked statically.
  - Loading external symbol files
  - Better errors / backtraces
  - Use debug info if available (for errors, interface)
-
-
-
-[Unicorn]: https://www.unicorn-engine.org
-[pyelftools]: https://github.com/eliben/pyelftools
