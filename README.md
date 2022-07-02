@@ -2,7 +2,7 @@
 
 Core dump code interpreter.
 
-Originally based on mildsunrise/emucore.
+Originally based on [mildsunrise/emucore](https://github.com/mildsunrise/emucore).
 
 ## EmuCore
 
