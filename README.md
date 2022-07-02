@@ -4,6 +4,83 @@ Core dump code interpreter.
 
 Originally based on [mildsunrise/emucore](https://github.com/mildsunrise/emucore).
 
+```
+$ python3.10 test.py 
+Loading header, size 5.2 MB
+stack tracing requested but not available, disabling...
+Traceback (most recent call last):
+  File "/home/vladimir/coredump-tools/tracer/binding.py", line 17, in <module>
+    tracer_file = CDLL(tracer_file)
+  File "/usr/local/lib/python3.10/ctypes/__init__.py", line 374, in __init__
+    self._handle = _dlopen(self._name, mode)
+OSError: /home/vladimir/coredump-tools/tracer/tracer.so: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/vladimir/coredump-tools/emucore.py", line 42, in <module>
+    from tracer.binding import StackTracer
+  File "/home/vladimir/coredump-tools/tracer/binding.py", line 19, in <module>
+    raise ImportError('could not load tracer library') from e
+ImportError: could not load tracer library
+Segment 0x7f377a400000-0x7f3caa000000 intersects file boundaries, looks like the core dump is truncated.
+...
+Segment 0x7fff869d8000-0x7fff869da000 is outside of file boundaries, looks like the core dump is truncated.
+Segment 0xffffffffff600000-0xffffffffff601000 is outside of file boundaries, looks like the core dump is truncated.
+Would load /usr/bin/clickhouse from s3://chebotarev-core-dump/clickhouse, size 326.3 MB
+Would load /usr/lib64/libc-2.17.so from s3://chebotarev-core-dump/libc-2.17.so, size 2.2 MB
+Skipping /usr/lib64/libc-2.17.so
+Would load /usr/lib64/libnss_files-2.17.so from s3://chebotarev-core-dump/libnss_files-2.17.so, size 61.6 kB
+Skipping /usr/lib64/libnss_files-2.17.so
+Would load /usr/lib/locale/locale-archive from s3://chebotarev-core-dump/locale-archive, size 106.2 MB
+Would load /usr/lib64/libm-2.17.so from s3://chebotarev-core-dump/libm-2.17.so, size 1.1 MB
+Skipping /usr/lib64/libm-2.17.so
+Would load /usr/lib64/libdl-2.17.so from s3://chebotarev-core-dump/libdl-2.17.so, size 19.2 kB
+Skipping /usr/lib64/libdl-2.17.so
+Would load /usr/lib64/libpthread-2.17.so from s3://chebotarev-core-dump/libpthread-2.17.so, size 142.1 kB
+Skipping /usr/lib64/libpthread-2.17.so
+Would load /usr/lib64/librt-2.17.so from s3://chebotarev-core-dump/librt-2.17.so, size 43.7 kB
+Skipping /usr/lib64/librt-2.17.so
+Would load /usr/lib64/ld-2.17.so from s3://chebotarev-core-dump/ld-2.17.so, size 163.3 kB
+Loading 0x200000..0x300000 from s3://chebotarev-core-dump/clickhouse, size 1.0 MB
+Loading 0x13b08000..0x13c08000 from s3://chebotarev-core-dump/coredump, size 1.0 MB
+cannot find DT_DEBUG tag in binary. either it is a statically linked executable or it does not conform to the debugger interface, in which case info about shared libraries will be lost
+cannot locate libc, found 0 candidates. skipping glibc patches...
+Loading 0xf907000..0xfa07000 from s3://chebotarev-core-dump/clickhouse, size 1.0 MB
+Loading 0x7f352d3c9000..0x7f352d4c9000 from s3://chebotarev-core-dump/coredump, size 1.0 MB
+000000000F9070B5 498B6D00             mov rbp,[r13]
+000000000F9070B9 4D8B7508             mov r14,[r13+8]
+000000000F9070BD 4C39F5               cmp rbp,r14
+000000000F9070C0 0F845C020000         je near 000000000F907322h
+000000000F9070C6 4C8DAC2488000000     lea r13,[rsp+88h]
+000000000F9070CE 4C8DBC2489000000     lea r15,[rsp+89h]
+000000000F9070D6 4C8D642438           lea r12,[rsp+38h]
+000000000F9070DB EB10                 jmp short 000000000F9070EDh
+000000000F9070DD 0F1F00               nop dword [rax]
+000000000F9070E0 4883C508             add rbp,8
+000000000F9070E4 4939EE               cmp r14,rbp
+000000000F9070E7 0F8429020000         je near 000000000F907316h
+000000000F9070ED 0F57C0               xorps xmm0,xmm0
+000000000F9070F0 410F114500           movups [r13],xmm0
+Traceback (most recent call last):
+  File "/home/vladimir/coredump-tools/test.py", line 17, in <module>
+    emu.call(
+  File "/home/vladimir/coredump-tools/emucore.py", line 863, in call
+    emu.emu_start(func, ret_addr, time_limit, instruction_limit)
+  File "/home/vladimir/.local/lib/python3.10/site-packages/unicorn/unicorn.py", line 344, in emu_start
+    raise self._hook_exception
+  File "/home/vladimir/.local/lib/python3.10/site-packages/unicorn/unicorn.py", line 212, in wrapper
+    return func(self, *args, **kwargs)
+  File "/home/vladimir/.local/lib/python3.10/site-packages/unicorn/unicorn.py", line 513, in _hook_mem_invalid_cb
+    return cb(self, access, address, size, value, data)
+  File "/home/vladimir/coredump-tools/emucore.py", line 238, in <lambda>
+    self.emu.hook_add(hook, (lambda cb: lambda *args: cb(*args[1:-1]))(cb), None, 1, 0, *args)
+  File "/home/vladimir/coredump-tools/emucore.py", line 787, in __hook_mem
+    raise self.__emulation_error(f'{text}, which is invalid') from None
+emucore.EmulationError: read of 8 bytes at 0x7f3ff388b640, which is invalid
+  at 0xf9070b5 (/usr/bin/clickhouse[0xf7060b5]), sp=0x7f0ffffffffffee8
+```
+
 ## EmuCore
 
 Module that emulates function calls on a coredump.
