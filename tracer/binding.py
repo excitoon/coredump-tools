@@ -1,43 +1,39 @@
 from typing import Optional
-from ctypes import byref, cast, Structure, CDLL, POINTER, c_void_p, c_uint64, c_size_t
-from os.path import dirname, join, isfile
+import ctypes
+import os
 
-try:
-    from unicorn.unicorn import uc, Uc, UcError, _uc, UC_HOOK_CODE_CB, uc_hook_h
-except ImportError as e:
-    raise ImportError('could not import Unicorn internals') from e
+import unicorn
 
-__all__ = ['StackTracer']
 
 # load shared library
 
-tracer_file = join(dirname(__file__), 'tracer.so')
+tracer_file = os.path.join(os.path.dirname(__file__), 'tracer.so')
 
 try:
-    tracer_file = CDLL(tracer_file)
+    tracer_file = ctypes.CDLL(tracer_file)
 except OSError as e:
     raise ImportError('could not load tracer library') from e
 
-cast(tracer_file.uc_reg_read, POINTER(c_void_p))[0] = cast(_uc.uc_reg_read, c_void_p)
-hook_block = cast(tracer_file.hook_block, UC_HOOK_CODE_CB)
+ctypes.cast(tracer_file.uc_reg_read, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.cast(unicorn.unicorn._uc.uc_reg_read, ctypes.c_void_p)
+hook_block = ctypes.cast(tracer_file.hook_block, unicorn.unicorn.UC_HOOK_CODE_CB)
 
-# interface code
 
-class Entry(Structure):
-    _fields_ = [("sp", c_uint64),
-                ("ip", c_uint64)]
-class Data(Structure):
-    _fields_ = [("capacity", c_size_t),
-                ("size", c_size_t),
-                ("entries", POINTER(Entry))]
+class Entry(ctypes.Structure):
+    _fields_ = [("sp", ctypes.c_uint64),
+                ("ip", ctypes.c_uint64)]
+
+class Data(ctypes.Structure):
+    _fields_ = [("capacity", ctypes.c_size_t),
+                ("size", ctypes.c_size_t),
+                ("entries", ctypes.POINTER(Entry))]
 
 class StackTracer(object):
     data: Data
-    handle: Optional[uc_hook_h]
+    handle: Optional[unicorn.unicorn.uc_hook_h]
 
     def __init__(self, capacity: int):
         self._entries = (Entry * capacity)()
-        entries = cast(byref(self._entries), POINTER(Entry))
+        entries = ctypes.cast(ctypes.byref(self._entries), ctypes.POINTER(Entry))
         self.data = Data(capacity, 0, entries)
         self.handle = None
 
@@ -48,18 +44,18 @@ class StackTracer(object):
     def entries(self) -> list[tuple[int, int]]:
         return [ (self._entries[n].sp, self._entries[n].ip) for n in range(self.data.size) ]
 
-    def set_attached(self, attached: bool, emu: Uc):
+    def set_attached(self, attached: bool, emu: unicorn.unicorn.Uc):
         '''Attach or detach the hooks if needed. Uc instance is passed
         here to avoid creating reference cycles.'''
         if not (self.handle is None) == attached: return
         if attached:
-            handle = uc_hook_h()
-            err = _uc.uc_hook_add(
-                emu._uch, byref(handle), uc.UC_HOOK_BLOCK, hook_block,
-                cast(byref(self.data), c_void_p),
-                c_uint64(1), c_uint64(0)
+            handle = unicorn.unicorn.uc_hook_h()
+            err = unicorn.unicorn._uc.uc_hook_add(
+                emu._uch, ctypes.byref(handle), unicorn.unicorn.uc.UC_HOOK_BLOCK, hook_block,
+                ctypes.cast(ctypes.byref(self.data), ctypes.c_void_p),
+                ctypes.c_uint64(1), ctypes.c_uint64(0)
             )
-            if err != uc.UC_ERR_OK: raise UcError(err)
+            if err != unicorn.unicorn.uc.UC_ERR_OK: raise unicorn.unicorn.UcError(err)
             self.handle = handle.value
         else:
             emu.hook_del(self.handle)

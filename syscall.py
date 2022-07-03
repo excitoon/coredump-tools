@@ -1,9 +1,5 @@
-'''Constants / logic related to Linux syscalls.'''
-
 from enum import Enum, unique
 from typing import Callable, NamedTuple
-
-__all__ = ['SyscallX64', 'Errno', 'FutexCmd', 'FutexOp']
 
 
 @unique
@@ -653,21 +649,22 @@ class FutexOp(NamedTuple):
     def effective_oparg(self) -> int:
         # FIXME: sign extension?
         return (1 << self.oparg_shift) if self.oparg_shift else self.oparg
+
     def new_value(self, old: int) -> int:
         return self.op.impl(old, self.effective_oparg)
+
     def compare(self, old: int) -> int:
         return self.cmp.impl(old, self.cmparg)
 
     @staticmethod
     def load(cmd: int):
         assert isinstance(cmd, int)
-        if cmd >> 32: raise ValueError()
+        if cmd >> 32:
+            raise ValueError()
         return FutexOp(oparg_shift=bool(cmd >> 31),
             op=FutexOp.Op((cmd >> 28) & 7), cmp=FutexOp.Cmp((cmd >> 24) & 0xF),
-            oparg=((cmd >> 12) & 0xFFF),    cmparg=((cmd) & 0xFFF))
+            oparg=((cmd >> 12) & 0xFFF), cmparg=((cmd) & 0xFFF))
 
     def save(self) -> int:
         assert not (self.oparg >> 12) and not (self.cmparg >> 12)
-        return (int(self.oparg_shift) << 31) \
-            | (self.op.value << 28) | (self.cmp.value << 24) \
-            | (self.oparg << 12)    | (self.cmparg)
+        return (int(self.oparg_shift) << 31) | (self.op.value << 28) | (self.cmp.value << 24) | (self.oparg << 12) | self.cmparg

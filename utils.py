@@ -1,19 +1,18 @@
-import enum
-import itertools
-import mmap
-import struct
 
 from typing import Any, BinaryIO, Callable, Iterator, Literal, NamedTuple, TypeVar, Union, Optional  
-from dataclasses import dataclass
 
 from elftools.elf.elffile import ELFFile
 from elftools.elf.structs import ELFStructs
 from elftools.elf.sections import Symbol as ELFSymbol
 from elftools.elf.segments import Segment
-from unicorn.unicorn import uc, x86_const
 from elftools.elf.constants import P_FLAGS
 
+import dataclasses
+import enum
 import io
+import itertools
+import mmap
+import struct
 
 import unicorn
 
@@ -30,8 +29,6 @@ def try_enum(cls, x):
         return cls(x)
     except ValueError:
         return x
-
-# general serialization utilities
 
 def read_struct(st: BinaryIO, fmt: Union[str, struct.Struct]):
     desc = struct.Struct(fmt) if isinstance(fmt, str) else fmt
@@ -181,8 +178,7 @@ class VMA(NamedTuple):
 
 def parse_load_segments(elf: ELFFile) -> list[tuple[VMA, int]]:
     '''Parses the LOAD segments of an ELFFile into a list of (vma, flags) tuples'''
-    return [ parsed for seg in elf.iter_segments()
-        if seg['p_type'] == 'PT_LOAD' and (parsed := parse_load_segment(seg))[0].size ]
+    return [parsed for seg in elf.iter_segments() if seg['p_type'] == 'PT_LOAD' and (parsed := parse_load_segment(seg))[0].size]
 
 def parse_load_segment(seg: Segment):
     '''See parse_load_segments'''
@@ -207,42 +203,45 @@ def parse_file_note(note) -> list[FileMapping]:
 def elf_flags_to_uc_prot(flags: int) -> int:
     ''' Converts segment flags into Unicorn prot bitmask '''
     prot = 0
-    if flags & P_FLAGS.PF_R: prot |= uc.UC_PROT_READ
-    if flags & P_FLAGS.PF_W: prot |= uc.UC_PROT_WRITE
-    if flags & P_FLAGS.PF_X: prot |= uc.UC_PROT_EXEC
+    if flags & P_FLAGS.PF_R:
+        prot |= unicorn.unicorn.uc.UC_PROT_READ
+    if flags & P_FLAGS.PF_W:
+        prot |= unicorn.unicorn.uc.UC_PROT_WRITE
+    if flags & P_FLAGS.PF_X:
+        prot |= unicorn.unicorn.uc.UC_PROT_EXEC
     return prot
 
 # parsing of other core notes
 
 # FIXME: do we need to write RBX or BX?
 X64_REGSTATE = [
-    x86_const.UC_X86_REG_R15,
-    x86_const.UC_X86_REG_R14,
-    x86_const.UC_X86_REG_R13,
-    x86_const.UC_X86_REG_R12,
-    x86_const.UC_X86_REG_BP,
-    x86_const.UC_X86_REG_BX,
-    x86_const.UC_X86_REG_R11,
-    x86_const.UC_X86_REG_R10,
-    x86_const.UC_X86_REG_R9,
-    x86_const.UC_X86_REG_R8,
-    x86_const.UC_X86_REG_AX,
-    x86_const.UC_X86_REG_CX,
-    x86_const.UC_X86_REG_DX,
-    x86_const.UC_X86_REG_SI,
-    x86_const.UC_X86_REG_DI,
-    x86_const.UC_X86_REG_AX,
-    x86_const.UC_X86_REG_IP,
-    x86_const.UC_X86_REG_CS,
-    x86_const.UC_X86_REG_EFLAGS,
-    x86_const.UC_X86_REG_SP,
-    x86_const.UC_X86_REG_SS,
-    x86_const.UC_X86_REG_FS_BASE,
-    x86_const.UC_X86_REG_GS_BASE,
-    x86_const.UC_X86_REG_DS,
-    x86_const.UC_X86_REG_ES,
-    x86_const.UC_X86_REG_FS,
-    x86_const.UC_X86_REG_GS,
+    unicorn.unicorn.x86_const.UC_X86_REG_R15,
+    unicorn.unicorn.x86_const.UC_X86_REG_R14,
+    unicorn.unicorn.x86_const.UC_X86_REG_R13,
+    unicorn.unicorn.x86_const.UC_X86_REG_R12,
+    unicorn.unicorn.x86_const.UC_X86_REG_BP,
+    unicorn.unicorn.x86_const.UC_X86_REG_BX,
+    unicorn.unicorn.x86_const.UC_X86_REG_R11,
+    unicorn.unicorn.x86_const.UC_X86_REG_R10,
+    unicorn.unicorn.x86_const.UC_X86_REG_R9,
+    unicorn.unicorn.x86_const.UC_X86_REG_R8,
+    unicorn.unicorn.x86_const.UC_X86_REG_AX,
+    unicorn.unicorn.x86_const.UC_X86_REG_CX,
+    unicorn.unicorn.x86_const.UC_X86_REG_DX,
+    unicorn.unicorn.x86_const.UC_X86_REG_SI,
+    unicorn.unicorn.x86_const.UC_X86_REG_DI,
+    unicorn.unicorn.x86_const.UC_X86_REG_AX,
+    unicorn.unicorn.x86_const.UC_X86_REG_IP,
+    unicorn.unicorn.x86_const.UC_X86_REG_CS,
+    unicorn.unicorn.x86_const.UC_X86_REG_EFLAGS,
+    unicorn.unicorn.x86_const.UC_X86_REG_SP,
+    unicorn.unicorn.x86_const.UC_X86_REG_SS,
+    unicorn.unicorn.x86_const.UC_X86_REG_FS_BASE,
+    unicorn.unicorn.x86_const.UC_X86_REG_GS_BASE,
+    unicorn.unicorn.x86_const.UC_X86_REG_DS,
+    unicorn.unicorn.x86_const.UC_X86_REG_ES,
+    unicorn.unicorn.x86_const.UC_X86_REG_FS,
+    unicorn.unicorn.x86_const.UC_X86_REG_GS,
 ]
 
 def parse_old_timeval(st: BinaryIO):
@@ -255,7 +254,7 @@ class Siginfo(NamedTuple):
     si_code: int   # extra code
     si_errno: int  # errno
 
-@dataclass
+@dataclasses.dataclass
 class Prstatus(object):
     # COMMON DATA
 
@@ -290,7 +289,7 @@ class Prstatus(object):
         # parse common data
         common = read_struct(st, '<' + '3i' + 'h2x' + 'QQ' + '4I')
         common = (Siginfo(*common[:3]),) + common[3:]
-        times = [ parse_old_timeval(st) for _ in range(4) ]
+        times = [parse_old_timeval(st) for _ in range(4)]
         # FIXME: parse siginfo note too (same info?)
 
         # parse GP regs
@@ -465,25 +464,25 @@ class Symbol(NamedTuple):
 # ABI-specific
 
 SYSV_AMD_ARG_REGS = [
-    x86_const.UC_X86_REG_RDI,
-    x86_const.UC_X86_REG_RSI,
-    x86_const.UC_X86_REG_RDX,
-    x86_const.UC_X86_REG_RCX,
-    x86_const.UC_X86_REG_R8,
-    x86_const.UC_X86_REG_R9,
+    unicorn.unicorn.x86_const.UC_X86_REG_RDI,
+    unicorn.unicorn.x86_const.UC_X86_REG_RSI,
+    unicorn.unicorn.x86_const.UC_X86_REG_RDX,
+    unicorn.unicorn.x86_const.UC_X86_REG_RCX,
+    unicorn.unicorn.x86_const.UC_X86_REG_R8,
+    unicorn.unicorn.x86_const.UC_X86_REG_R9,
 ]
 
 # Unicorn utilities
 
 MemEntry = tuple[Literal['READ', 'WRITE', 'FETCH'], Literal['OK', 'UNMAPPED', 'PROT']]
 UC_MEM_TYPES: dict[int, MemEntry] = {
-    uc.UC_MEM_READ: ('READ', 'OK'),
-    uc.UC_MEM_WRITE: ('WRITE', 'OK'),
-    uc.UC_MEM_FETCH: ('FETCH', 'OK'),
-    uc.UC_MEM_READ_UNMAPPED: ('READ', 'UNMAPPED'),
-    uc.UC_MEM_WRITE_UNMAPPED: ('WRITE', 'UNMAPPED'),
-    uc.UC_MEM_FETCH_UNMAPPED: ('FETCH', 'UNMAPPED'),
-    uc.UC_MEM_WRITE_PROT: ('WRITE', 'PROT'),
-    uc.UC_MEM_READ_PROT: ('READ', 'PROT'),
-    uc.UC_MEM_FETCH_PROT: ('FETCH', 'PROT'),
+    unicorn.unicorn.uc.UC_MEM_READ: ('READ', 'OK'),
+    unicorn.unicorn.uc.UC_MEM_WRITE: ('WRITE', 'OK'),
+    unicorn.unicorn.uc.UC_MEM_FETCH: ('FETCH', 'OK'),
+    unicorn.unicorn.uc.UC_MEM_READ_UNMAPPED: ('READ', 'UNMAPPED'),
+    unicorn.unicorn.uc.UC_MEM_WRITE_UNMAPPED: ('WRITE', 'UNMAPPED'),
+    unicorn.unicorn.uc.UC_MEM_FETCH_UNMAPPED: ('FETCH', 'UNMAPPED'),
+    unicorn.unicorn.uc.UC_MEM_WRITE_PROT: ('WRITE', 'PROT'),
+    unicorn.unicorn.uc.UC_MEM_READ_PROT: ('READ', 'PROT'),
+    unicorn.unicorn.uc.UC_MEM_FETCH_PROT: ('FETCH', 'PROT'),
 }

@@ -1,13 +1,6 @@
 from typing import Callable, Literal, Optional, Union
 
-from utils import read_struct, write_struct, read_bstr, read_str, write_str, \
-    sort_and_ensure_disjoint, VMA, \
-    parse_load_segments, parse_file_note, Prstatus, FileMapping, \
-    parse_auxv_note, AuxvField, \
-    parse_dynamic_section, RtState, RtLoadedObject, Symbol, \
-    elf_flags_to_uc_prot, SYSV_AMD_ARG_REGS, UC_MEM_TYPES
-
-from syscall import SyscallX64, Errno, FutexCmd, FutexOp
+from utils import read_struct, write_struct, read_bstr, read_str, write_str
 
 import bisect
 import collections
@@ -29,10 +22,9 @@ import s3path
 import sortedcontainers
 import unicorn
 
+import syscall
 import utils
 
-
-__all__ = ['EmuCore', 'EmulationError']
 
 logger = logging.getLogger(__name__)
 
@@ -114,18 +106,18 @@ class EmuCore(object):
     mappings_mm: dict[bytes, tuple[bytes, mmap.mmap]]
 
     # parsed info
-    threads: list[Prstatus]
-    mappings: list[FileMapping]
+    threads: list[utils.Prstatus]
+    mappings: list[utils.FileMapping]
     mappings__keys: list[int]    # start addresses
     auxv: dict[int, int]
     # WARNING: below properties will be absent if __load_symbols() failed
-    loaded_objects: list[RtLoadedObject]
-    symbols: dict[str, set[Symbol]]
+    loaded_objects: list[utils.RtLoadedObject]
+    symbols: dict[str, set[utils.Symbol]]
     symbols_by_type_by_addr: dict[
-        Symbol.Type,             # for each type...
+        utils.Symbol.Type,             # for each type...
         tuple[
             list[int],           # keys (addresses)
-            list[set[Symbol]],  # values (symbols at an address)
+            list[set[utils.Symbol]],  # values (symbols at an address)
         ]
     ]
 
@@ -205,15 +197,15 @@ class EmuCore(object):
 
         # files
         file_note = next((n['n_desc'] for n in notes if n['n_type'] == 'NT_FILE'))
-        self.mappings = sort_and_ensure_disjoint(parse_file_note(file_note), lambda x: x[1])
+        self.mappings = utils.sort_and_ensure_disjoint(utils.parse_file_note(file_note), lambda x: x[1])
         self.mappings__keys = [vma.start for _, vma in self.mappings]
 
         # threads
-        self.threads = list(map(Prstatus.load, filter(lambda n: n['n_type'] == 'NT_PRSTATUS', notes)))
+        self.threads = list(map(utils.Prstatus.load, filter(lambda n: n['n_type'] == 'NT_PRSTATUS', notes)))
 
         # process
         # FIXME: parse PRPSINFO
-        self.auxv = parse_auxv_note(next((n for n in notes if n['n_type'] == 'NT_AUXV')))
+        self.auxv = utils.parse_auxv_note(next((n for n in notes if n['n_type'] == 'NT_AUXV')))
 
         # Initialize emulator instance
         self.emu = unicorn.Uc(unicorn.unicorn.uc.UC_ARCH_X86, unicorn.unicorn.uc.UC_MODE_64)
@@ -244,7 +236,7 @@ class EmuCore(object):
             self.stack_tracer.set_attached(True, self.emu)
 
         # Map everything into emulator
-        if (pagesize := self.auxv[AuxvField.PAGESZ.value]) != mmap.PAGESIZE:
+        if (pagesize := self.auxv[utils.AuxvField.PAGESZ.value]) != mmap.PAGESIZE:
             logger.warn(f'coredump page size ({pagesize}) differs from host ({mmap.PAGESIZE})')
 
         assert self.emu.query(unicorn.unicorn.uc.UC_QUERY_PAGE_SIZE) <= mmap.PAGESIZE
@@ -318,11 +310,11 @@ class EmuCore(object):
     def __load_core_segments(self):
         '''Read LOAD segments from core and map them'''
 
-        load_segs = parse_load_segments(self.core)
+        load_segs = utils.parse_load_segments(self.core)
         logger.info(f'Would map {len(load_segs)} LOAD segments, total size {sum((vma.size for vma, _ in load_segs))}...')
 
         for vma, flags in load_segs:
-            prot = elf_flags_to_uc_prot(flags)
+            prot = utils.elf_flags_to_uc_prot(flags)
             if vma.offset >= utils.mmapsize(self.__size):
                 print(f'Segment {hex(vma.start)}-{hex(vma.start+vma.size)} is outside of file boundaries, looks like the core dump is truncated.')
             elif vma.offset_end > utils.mmapsize(self.__size):
@@ -355,24 +347,24 @@ class EmuCore(object):
         ensure_bytes = lambda x: x.encode() if isinstance(x, str) else x
 
         # remove mappings that overlap with already loaded regions
-        regions = sort_and_ensure_disjoint((s, e+1) for s, e, _ in self.emu.mem_regions())
+        regions = utils.sort_and_ensure_disjoint((s, e+1) for s, e, _ in self.emu.mem_regions())
         mappings = []
         for fname, (start, end, offset) in self.mappings:
             while True:
                 regstart, regend = regions[0] if regions else (end, end)
                 if regend > start:
                     if start < regstart:
-                        mappings.append((fname, VMA(start, min(end, regstart), offset)))
+                        mappings.append((fname, utils.VMA(start, min(end, regstart), offset)))
                     if end <= regend: break
                     start, offset = regend, offset + (regend - start)
                 regions.pop(0)
 
         # collect simplified mappings for each file
         # (note that we keep all files, even if they no longer have VMAs)
-        file_mappings: dict[bytes, list[VMA]] = { fn.decode(): [] for fn, _ in self.mappings }
+        file_mappings: dict[bytes, list[utils.VMA]] = {fn.decode(): [] for fn, _ in self.mappings}
         for fname, vma in mappings:
             file_mappings[fname.decode()].append(vma)
-        file_mappings = { k: VMA.simplify(v) for k, v in file_mappings.items() }
+        file_mappings = {k: utils.VMA.simplify(v) for k, v in file_mappings.items()}
 
         # filter / transform files according to settings
         is_invalid = lambda fn: fn.startswith('anon_inode:') or fn.startswith('/memfd:') or fn.endswith(' (deleted)')
@@ -381,12 +373,12 @@ class EmuCore(object):
             (skip_invalid and is_invalid(fn)) or (skip_special and is_special(fn)) \
             or any(fn.startswith(pref) for pref in blacklist)
         file_filter = lambda fn: any(fn.startswith(pref) for pref in whitelist) or not file_skipped(fn)
-        mapped_filenames = { fn: fn2 for fn in file_mappings if file_filter(fn) and (fn2 := filename_map(fn)) != None }
+        mapped_filenames = {fn: fn2 for fn in file_mappings if file_filter(fn) and (fn2 := filename_map(fn)) != None}
 
-        skipped_with_vmas = [ fn for fn, vmas in file_mappings.items() if fn not in mapped_filenames and vmas ]
+        skipped_with_vmas = [fn for fn, vmas in file_mappings.items() if fn not in mapped_filenames and vmas]
         if skipped_with_vmas:
             logger.info('Skipped files with VMAs:\n{}'.format('\n'.join(f' - {fn}' for fn in skipped_with_vmas )))
-        file_mappings = { fn: v for fn, v in file_mappings.items() if fn in mapped_filenames }
+        file_mappings = {fn: v for fn, v in file_mappings.items() if fn in mapped_filenames}
         total_mappings = sum(len(v) for v in file_mappings.values())
         logger.info(f'Mapping {len(file_mappings)} files, {total_mappings} VMAs...')
 
@@ -426,7 +418,7 @@ class EmuCore(object):
         If you need more control, call `get_symbol()` directly.
         '''
         if isinstance(start, str):
-            if not (syms := self.get_symbols(start, stype=Symbol.Type.OBJECT)):
+            if not (syms := self.get_symbols(start, stype=utils.Symbol.Type.OBJECT)):
                 raise ValueError(f'no OBJECT symbol found for {start}')
             start, size = syms[0].addr, syms[0].size
         stream = utils.UnicornIO(self, start, size, offset)
@@ -472,7 +464,7 @@ class EmuCore(object):
             if ret_address != new_stack_addr:
                 raise Exception('stack reservations MUST be released in reverse order')
 
-    def find_mapping(self, addr: int) -> FileMapping:
+    def find_mapping(self, addr: int) -> utils.FileMapping:
         idx = bisect.bisect(self.mappings__keys, addr)
         if idx > 0 and addr < self.mappings[idx-1][1].end:
             return self.mappings[idx-1]
@@ -503,7 +495,7 @@ class EmuCore(object):
 
             # process
             # FIXME: parse PRPSINFO
-            auxv = parse_auxv_note(next((n for n in notes if n['n_type'] == 'NT_AUXV')))
+            auxv = utils.parse_auxv_note(next((n for n in notes if n['n_type'] == 'NT_AUXV')))
 
             elf = self.__symbols
 
@@ -518,8 +510,8 @@ class EmuCore(object):
         # Use auxv to locate program header of main executable, parse them
         # (we are using the raw structs here and not ELFFile, because this is
         # not the ELF file as seen on disk but its loaded version)
-        phdr_base = auxv[AuxvField.PHDR.value]
-        phdr_num = auxv[AuxvField.PHNUM.value]
+        phdr_base = auxv[utils.AuxvField.PHDR.value]
+        phdr_num = auxv[utils.AuxvField.PHNUM.value]
         phdr = utils.parse_program_header(elf.structs, self.mem(phdr_base)#FIXME???
 , phdr_num)
         # FIXME: use VMAs to locate base of executable, we'll need it to translate vaddrs, how tf does ld do it??
@@ -529,7 +521,7 @@ class EmuCore(object):
         # Find r_debug (debugger interface entry point) through the DT_DEBUG tag
         try:
             dyn_seg = next((seg['p_vaddr'] for seg in phdr if seg['p_type'] == 'PT_DYNAMIC'))
-            dt_debug = next(parse_dynamic_section(elf.structs, self.mem(main_base + dyn_seg), 'DT_DEBUG'))['d_ptr']
+            dt_debug = next(utils.parse_dynamic_section(elf.structs, self.mem(main_base + dyn_seg), 'DT_DEBUG'))['d_ptr']
 
         except StopIteration:
             logger.warn('cannot find DT_DEBUG tag in binary. either it is a '
@@ -548,9 +540,9 @@ class EmuCore(object):
         r_version, r_map, r_brk, r_state, r_ldbase = self.mem(dt_debug).read_struct('<i4xQQi4xQ')
         if r_version != 1:
             logger.warn(f'unexpected/unsupported debugger interface version {r_version}. will try to parse anyway...')
-        if r_state != RtState.CONSISTENT.value:
+        if r_state != utils.RtState.CONSISTENT.value:
             logger.warn('coredump was taken when loaded objects list was in an unconsistent state. will try to parse anyway...')
-        self.loaded_objects = list(RtLoadedObject.iterate(self.mem(), r_map))
+        self.loaded_objects = list(utils.RtLoadedObject.iterate(self.mem(), r_map))
 
         # Actually load the symbols of each object
         logger.info(f'Loading symbols for {len(self.loaded_objects)} objects...')
@@ -563,9 +555,9 @@ class EmuCore(object):
             stype: list(zip(*sorted(addrs.items()))) for stype, addrs in by_addr.items() }
 
 
-    def __load_symbols_for(self, obj: RtLoadedObject, by_addr: dict[Symbol.Type, dict[int, list[Symbol]]]):
+    def __load_symbols_for(self, obj: utils.RtLoadedObject, by_addr: dict[utils.Symbol.Type, dict[int, list[utils.Symbol]]]):
         # Find mapped disk file, open it
-        if obj.addr != self.auxv.get(AuxvField.SYSINFO_EHDR.value):
+        if obj.addr != self.auxv.get(utils.AuxvField.SYSINFO_EHDR.value):
             fname, _ = self.find_mapping(obj.ld)
             if fname not in self.mappings_mm:
                 logger.warn(f'mappings for {fname} failed or were skipped, its symbols will not be loaded')
@@ -586,7 +578,7 @@ class EmuCore(object):
                 if not isinstance(table, elftools.elf.sections.SymbolTableSection):
                     continue
                 for sym in table.iter_symbols():
-                    sym = Symbol.load(obj, sym)
+                    sym = utils.Symbol.load(obj, sym)
                     if not sym.defined: continue
                     self.symbols[sym.name].add(sym)
                     by_addr[sym.type][sym.addr].add(sym)
@@ -599,17 +591,17 @@ class EmuCore(object):
 
 
     def get_symbols(self, name: str,
-        stype: Optional[Symbol.Type]=Symbol.Type.FUNC,
-        obj: Optional[RtLoadedObject]=None,
+        stype: Optional[utils.Symbol.Type]=utils.Symbol.Type.FUNC,
+        obj: Optional[utils.RtLoadedObject]=None,
         exposed_only: bool=False,
-    ) -> list[Symbol]:
+    ) -> list[utils.Symbol]:
         syms = getattr(self, 'symbols', {}).get(name, [])
         matches = lambda sym: \
             (obj is None or obj == sym.obj) and \
             (stype is None or stype == sym.type) and \
             (not exposed_only or sym.is_exposed)
         # FIXME: prioritize global, then weak, then local. also maybe visibility
-        return [ sym for sym in syms if matches(sym) ]
+        return [sym for sym in syms if matches(sym)]
 
     def get_symbol(self, name: str, *args, **kwargs) -> int:
         '''Resolve the address of a symbol (fails if none found)'''
@@ -618,17 +610,15 @@ class EmuCore(object):
         return syms[0].addr
 
     def find_symbol(self, addr: int,
-        stype: Symbol.Type=Symbol.Type.FUNC, look_before: int=5,
+        stype: utils.Symbol.Type=utils.Symbol.Type.FUNC, look_before: int=5,
     ) -> dict:
         '''Try to find a symbol that addr is in'''
         assert not (stype is None)
         keys, buckets = getattr(self, 'symbols_by_type_by_addr', {}).get(stype, ([], []))
         idx = bisect.bisect(keys, addr)
         within_size = lambda sym, pos: not sym.size or pos < sym.size
-        filter_syms = lambda baddr, syms: \
-            ( sym for sym in syms if within_size(sym, addr - baddr) )
-        syms = [ sym for n in range(min(look_before, idx))
-            for sym in filter_syms(keys[idx-1-n], buckets[idx-1-n]) ]
+        filter_syms = lambda baddr, syms: (sym for sym in syms if within_size(sym, addr - baddr))
+        syms = [sym for n in range(min(look_before, idx)) for sym in filter_syms(keys[idx-1-n], buckets[idx-1-n])]
         if syms: return syms[0]
         raise ValueError(f'no {stype.name} symbol found at {addr:#x}')
 
@@ -645,17 +635,15 @@ class EmuCore(object):
         '''
         # first we have to locate libc among loaded objects
         test_sym = getattr(self, 'symbols', {}).get('strchr', [])
-        objs = { sym.obj for sym in test_sym if sym.is_callable and sym.is_exposed }
+        objs = {sym.obj for sym in test_sym if sym.is_callable and sym.is_exposed}
         if len(objs) != 1:
             logger.warn(f'cannot locate libc, found {len(objs)} candidates. skipping glibc patches...')
             return
         libc_obj = next(iter(objs))
 
         # collect libc function addresses
-        collect_addresses = lambda syms: { sym.addr \
-            for sym in syms if sym.obj == libc_obj and sym.is_function }
-        libc_syms = { name: addrs for name, syms in self.symbols.items()
-            if (addrs := collect_addresses(syms)) }
+        collect_addresses = lambda syms: {sym.addr for sym in syms if sym.obj == libc_obj and sym.is_function}
+        libc_syms = {name: addrs for name, syms in self.symbols.items() if (addrs := collect_addresses(syms))}
 
         # find candidates to patch
         hunks: list[tuple[int, int]] = []
@@ -663,12 +651,12 @@ class EmuCore(object):
             if not (m := re.fullmatch(r'(.+)_(avx|avx2|avx512)(_.+)?', name)):
                 continue
             replacements = ['_sse2', '_sse2_unaligned']
-            replacements = [ fn for n in replacements if (fn := m.group(1) + n) in libc_syms ]
+            replacements = [fn for n in replacements if (fn := m.group(1) + n) in libc_syms]
             if not replacements:
                 logger.warn(f'cannot find replacement for {name}, not patching')
                 continue
             target = next(iter(libc_syms[replacements[0]])) # FIXME: what if multiple?
-            hunks += [ (addr, target) for addr in addrs ]
+            hunks += [(addr, target) for addr in addrs]
 
         # the dynamic linker (also provided by glibc) also has one function
         # responsible for saving the registers. since the available registers
@@ -676,7 +664,7 @@ class EmuCore(object):
         # locate dynamic linker through AUXV, then its symbols:
         try:
             ld_obj = next(obj for obj in self.loaded_objects
-                if obj.addr == self.auxv[AuxvField.BASE.value])
+                if obj.addr == self.auxv[utils.AuxvField.BASE.value])
         except StopIteration:
             logger.warn(f'cannot find ld object. skipping ld patches...')
         else:
@@ -688,7 +676,7 @@ class EmuCore(object):
             ]
             for hunk in ld_hunks:
                 try:
-                    hunks.append(tuple( self.get_symbol(n, obj=ld_obj) for n in hunk ))
+                    hunks.append(tuple((self.get_symbol(n, obj=ld_obj) for n in hunk)))
                 except ValueError:
                     logger.warn(f'failed to patch {hunk[0]}, skiping patch...')
 
@@ -762,7 +750,7 @@ class EmuCore(object):
         return EmulationError(f'{msg}\n{self.format_exec_ctx()}')
 
     def __hook_mem(self, htype: int, addr: int, size: int, value: int):
-        access_type, cause = UC_MEM_TYPES[htype]
+        access_type, cause = utils.UC_MEM_TYPES[htype]
         faddr = self.format_code_addr(addr)
         text = f'{access_type.lower()} of {size} bytes at {faddr}'
 
@@ -801,15 +789,15 @@ class EmuCore(object):
 
         nr = self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RAX)
         try:
-            nr = SyscallX64(nr)
+            nr = syscall.SyscallX64(nr)
         except ValueError as e:
             raise self.__emulation_error(f'invalid syscall {nr}') from None
 
         if not (handler := getattr(self, '_syscall_' + nr.name, None)):
             raise self.__emulation_error(f'"{nr.name}" syscall')
         nparams = len(inspect.signature(handler).parameters)
-        result = handler(*(self.emu.reg_read(r) for r in SYSV_AMD_ARG_REGS[:nparams]))
-        if isinstance(result, Errno):
+        result = handler(*(self.emu.reg_read(r) for r in utils.SYSV_AMD_ARG_REGS[:nparams]))
+        if isinstance(result, syscall.Errno):
             result = -result.value
         else:
             assert isinstance(result, int) and result >= 0
@@ -845,8 +833,8 @@ class EmuCore(object):
             'float and other non-integer arguments not implemented yet'
         assert all(-(1 << 63) <= x < (1 << 64) for x in args), \
             'arguments must be in u64 or s64 range (128 ints not implemented yet)'
-        args = [ x & ~((~0) << 64) for x in args ]
-        arg_regs = SYSV_AMD_ARG_REGS
+        args = [x & ~((~0) << 64) for x in args]
+        arg_regs = utils.SYSV_AMD_ARG_REGS
         for p, reg in zip(args, arg_regs): emu.reg_write(reg, p)
         stack_args = args[len(arg_regs):]
 
@@ -870,21 +858,21 @@ class EmuCore(object):
 
     def _syscall_futex(self, uaddr: int, cmd_: int, val: int, timeout: int, uaddr2: int, val3: int):
         try:
-            cmd = FutexCmd.load(cmd_)
+            cmd = syscall.FutexCmd.load(cmd_)
         except ValueError:
             raise self.__emulation_error(f'invalid futex syscall {cmd_}') from None
 
-        if cmd.nr in { FutexCmd.Nr.WAKE, FutexCmd.Nr.WAKE_BITSET, FutexCmd.Nr.REQUEUE, FutexCmd.Nr.CMP_REQUEUE, FutexCmd.Nr.CMP_REQUEUE_PI, FutexCmd.Nr.WAKE_OP }:
+        if cmd.nr in {syscall.FutexCmd.Nr.WAKE, syscall.FutexCmd.Nr.WAKE_BITSET, syscall.FutexCmd.Nr.REQUEUE, syscall.FutexCmd.Nr.CMP_REQUEUE, syscall.FutexCmd.Nr.CMP_REQUEUE_PI, syscall.FutexCmd.Nr.WAKE_OP}:
             # wake operations are easy to implement: there are no other threads / processes, so just return 0
             # for some operations, we have to do prior checks / operations before the wake
-            if cmd.nr in { FutexCmd.Nr.CMP_REQUEUE, FutexCmd.Nr.CMP_REQUEUE_PI }:
+            if cmd.nr in {syscall.FutexCmd.Nr.CMP_REQUEUE, syscall.FutexCmd.Nr.CMP_REQUEUE_PI}:
                 if val3 >> 32:
                     raise self.__emulation_error('invalid futex CMP_REQUEUE syscall: val3 not u32')
                 if self.mem(uaddr).read_struct('<I')[0] != val3:
-                    return Errno.EAGAIN
-            if cmd.nr == FutexCmd.Nr.WAKE_OP:
+                    return syscall.Errno.EAGAIN
+            if cmd.nr == syscall.FutexCmd.Nr.WAKE_OP:
                 try:
-                    op = FutexOp.load(val3)
+                    op = syscall.FutexOp.load(val3)
                 except ValueError:
                     raise self.__emulation_error('invalid futex WAKE_OP syscall: val3 holds invalid op')
                 oldval = self.mem(uaddr2).read_struct('<I')[0]
