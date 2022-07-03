@@ -7,22 +7,6 @@ Originally based on [mildsunrise/emucore](https://github.com/mildsunrise/emucore
 ```
 $ python3.10 test.py 
 Loading header, size 5.2 MB
-stack tracing requested but not available, disabling...
-Traceback (most recent call last):
-  File "/home/vladimir/coredump-tools/tracer/binding.py", line 17, in <module>
-    tracer_file = CDLL(tracer_file)
-  File "/usr/local/lib/python3.10/ctypes/__init__.py", line 374, in __init__
-    self._handle = _dlopen(self._name, mode)
-OSError: /home/vladimir/coredump-tools/tracer/tracer.so: cannot open shared object file: No such file or directory
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/home/vladimir/coredump-tools/emucore.py", line 42, in <module>
-    from tracer.binding import StackTracer
-  File "/home/vladimir/coredump-tools/tracer/binding.py", line 19, in <module>
-    raise ImportError('could not load tracer library') from e
-ImportError: could not load tracer library
 Segment 0x7f377a400000-0x7f3caa000000 intersects file boundaries, looks like the core dump is truncated.
 ...
 Segment 0x7fff869d8000-0x7fff869da000 is outside of file boundaries, looks like the core dump is truncated.
@@ -65,7 +49,7 @@ Loading 0x7f352d3c9000..0x7f352d4c9000 from s3://chebotarev-core-dump/coredump, 
 Traceback (most recent call last):
   File "/home/vladimir/coredump-tools/test.py", line 17, in <module>
     emu.call(
-  File "/home/vladimir/coredump-tools/emucore.py", line 863, in call
+  File "/home/vladimir/coredump-tools/emucore.py", line 851, in call
     emu.emu_start(func, ret_addr, time_limit, instruction_limit)
   File "/home/vladimir/.local/lib/python3.10/site-packages/unicorn/unicorn.py", line 344, in emu_start
     raise self._hook_exception
@@ -73,11 +57,12 @@ Traceback (most recent call last):
     return func(self, *args, **kwargs)
   File "/home/vladimir/.local/lib/python3.10/site-packages/unicorn/unicorn.py", line 513, in _hook_mem_invalid_cb
     return cb(self, access, address, size, value, data)
-  File "/home/vladimir/coredump-tools/emucore.py", line 238, in <lambda>
+  File "/home/vladimir/coredump-tools/emucore.py", line 230, in <lambda>
     self.emu.hook_add(hook, (lambda cb: lambda *args: cb(*args[1:-1]))(cb), None, 1, 0, *args)
-  File "/home/vladimir/coredump-tools/emucore.py", line 787, in __hook_mem
+  File "/home/vladimir/coredump-tools/emucore.py", line 775, in __hook_mem
     raise self.__emulation_error(f'{text}, which is invalid') from None
 emucore.EmulationError: read of 8 bytes at 0x7f3ff388b640, which is invalid
+  at 0xf9070c6 (/usr/bin/clickhouse[0xf7060c6]), sp=0x7f0fffffffffffe0
   at 0xf9070b5 (/usr/bin/clickhouse[0xf7060b5]), sp=0x7f0ffffffffffee8
 ```
 
