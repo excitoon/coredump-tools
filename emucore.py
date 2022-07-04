@@ -23,27 +23,11 @@ import sortedcontainers
 import unicorn
 
 import syscall
+import tracer
 import utils
 
 
 logger = logging.getLogger(__name__)
-
-# try to load stack tracing module
-tracer_exc = None
-try:
-    from tracer.binding import StackTracer
-except ImportError as e:
-    tracer_exc = e
-tracer_exc_logged = False
-
-
-def is_stack_tracer_available():
-    global tracer_exc_logged
-    if not (tracer_exc is None) and not tracer_exc_logged:
-        logger.warn('stack tracing requested but not available, disabling...', exc_info=tracer_exc)
-        tracer_exc_logged = True
-    return tracer_exc is None
-
 
 # FIXME: a lot of these asserts should be exceptions, we should have a class
 # FIXME: proper log system
@@ -231,8 +215,8 @@ class EmuCore(object):
 
         # setup stack tracer
         self.stack_tracer = None
-        if trace_stack and is_stack_tracer_available():
-            self.stack_tracer = StackTracer(256)
+        if trace_stack and tracer.is_stack_tracer_available():
+            self.stack_tracer = tracer.StackTracer(256)
             self.stack_tracer.set_attached(True, self.emu)
 
         # Map everything into emulator
@@ -738,8 +722,8 @@ class EmuCore(object):
     def format_exec_ctx(self):
         '''Collect info about the current execution context and return it
         as formatted text. Used for errors.'''
-        tracer = self.stack_tracer
-        trace = ([] if tracer is None else list(tracer.entries)) + [(
+        stack_tracer = self.stack_tracer
+        trace = ([] if stack_tracer is None else list(stack_tracer.entries)) + [(
             self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RSP),
             self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RIP),
         )]
