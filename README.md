@@ -1,6 +1,6 @@
 # `coredump-tools`
 
-Core dump code interpreter.
+Coredump code interpreter.
 
 Originally based on [mildsunrise/emucore](https://github.com/mildsunrise/emucore).
 
