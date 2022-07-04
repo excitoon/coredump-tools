@@ -1,11 +1,11 @@
 import os
 
-import emucore
+import emulator
 
 
 s3_path = 's3://chebotarev-core-dump'
 
-emu = emucore.EmuCore(
+emu = emulator.Emulator(
     f'{s3_path}/coredump',
     #load_symbols=f'{s3_path}/058d7f7cde734632fbfd572bfa1f6325cdd929.debug', FIXME does not work
     mapping_load_kwargs={

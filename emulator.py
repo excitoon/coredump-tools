@@ -53,7 +53,7 @@ REQUIRED_PROT = mmap.PROT_READ | mmap.PROT_WRITE
 class EmulationError(Exception):
     pass
 
-class EmuCore(object):
+class Emulator(object):
     '''Emulator for core dumps.
 
     Once an instance is constructed and ready for use, see `call()` to invoke
