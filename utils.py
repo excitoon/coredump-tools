@@ -49,14 +49,11 @@ def read_bstr(st: BinaryIO, allow_trunc: bool=False, max_size: Optional[int]=16*
 def read_str(*kargs, encoding: str='utf-8', errors: str='strict', **kwargs) -> str:
     return read_bstr(*kargs, **kwargs).decode(encoding, errors)
 
-def write_str(
-    st: BinaryIO, x: Union[str, bytes, bytearray],
-    encoding: str='utf-8', errors: str='strict',
-    allow_invalid: bool=False,
-):
+def write_str(st: BinaryIO, x: Union[str, bytes, bytearray], encoding: str='utf-8', errors: str='strict', allow_invalid: bool=False):
     x = x.encode(encoding, errors) if isinstance(x, str) else x
     x = memoryview(x).cast('B')
-    if not allow_invalid: assert all(b for b in x)
+    if not allow_invalid:
+        assert all(b for b in x)
     fx = bytearray(len(x) + 1)
     fx[:len(x)] = x
     return st.write(fx)
@@ -72,6 +69,7 @@ class UnicornIO(io.RawIOBase):
     def __init__(self, emucore, start: int=0, size: Optional[int]=None, offset: int=0):
         if size is None:
             size = (1 << 64) - start
+
         assert 0 <= start <= (1 << 64)
         assert 0 <= size <= (1 << 64) - start
         self.__emucore = emucore
@@ -193,8 +191,7 @@ FileMapping = tuple[bytes, VMA]
 def parse_file_note(note) -> list[FileMapping]:
     '''Parses the LOAD segments of an ELFFile into a list of (filename, vma) tuples'''
     assert note['page_size'] > 0
-    parse_vma = lambda vma: \
-        VMA(vma['vm_start'], vma['vm_end'], vma['page_offset'] * note['page_size'])
+    parse_vma = lambda vma: VMA(vma['vm_start'], vma['vm_end'], vma['page_offset'] * note['page_size'])
     mappings = map(parse_vma, note['Elf_Nt_File_Entry'])
     mappings = list(zip(note['filename'], mappings))
     assert note['num_map_entries'] == len(mappings)
@@ -377,6 +374,7 @@ class RtLoadedObject(NamedTuple):
             yield RtLoadedObject(l_addr, l_name, l_ld)
             node = l_next
 
+
 # parse symbols
 
 class Symbol(NamedTuple):
@@ -425,6 +423,7 @@ class Symbol(NamedTuple):
     @property
     def is_function(self) -> bool:
         return self.type == Symbol.Type.FUNC
+
     @property
     def is_callable(self) -> bool:
         return self.type in {Symbol.Type.FUNC, Symbol.Type.IFUNC}
@@ -433,9 +432,11 @@ class Symbol(NamedTuple):
     @property
     def defined(self) -> bool:
         return self.shndx != 'SHN_UNDEF'
+
     @property
     def is_abs(self) -> bool:
         return self.shndx == 'SHN_ABS'
+
     @property
     def is_common(self) -> bool:
         return self.shndx == 'SHN_COMMON'
@@ -443,11 +444,12 @@ class Symbol(NamedTuple):
     # other useful computed properties
     @property
     def addr(self) -> int:
-        return self.obj.addr + self.value
+        # FIXME relocs
+        return (self.obj and self.obj.addr or 0) + self.value
+
     @property
     def is_exposed(self) -> bool:
-        return self.bind != Symbol.Bind.LOCAL and \
-            self.visibility in {Symbol.Visibility.DEFAULT, Symbol.Visibility.PROTECTED}
+        return self.bind != Symbol.Bind.LOCAL and self.visibility in {Symbol.Visibility.DEFAULT, Symbol.Visibility.PROTECTED}
 
     @staticmethod
     def load(obj: RtLoadedObject, x: ELFSymbol) -> 'Symbol':
@@ -460,6 +462,7 @@ class Symbol(NamedTuple):
             try_enum(Symbol.Visibility, x['st_other']['visibility']),
             x['st_shndx'],
         )
+
 
 # ABI-specific
 
@@ -475,6 +478,7 @@ SYSV_AMD_ARG_REGS = [
 # Unicorn utilities
 
 MemEntry = tuple[Literal['READ', 'WRITE', 'FETCH'], Literal['OK', 'UNMAPPED', 'PROT']]
+
 UC_MEM_TYPES: dict[int, MemEntry] = {
     unicorn.unicorn.uc.UC_MEM_READ: ('READ', 'OK'),
     unicorn.unicorn.uc.UC_MEM_WRITE: ('WRITE', 'OK'),

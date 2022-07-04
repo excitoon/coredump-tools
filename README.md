@@ -1,11 +1,12 @@
 # `coredump-tools`
 
-Coredump code interpreter.
+Coredump analysis tools. Allows to run code from coredumps without downloading and mapping all of it to memory. Works with S3 as data source and saves both RAM and disk space.
 
 Originally based on [mildsunrise/emucore](https://github.com/mildsunrise/emucore).
 
 ```
-$ python3.10 test.py 
+$ python3.10 -m examples.simple
+cc -fPIC -O3 -Wall -Wextra -Wno-unused-parameter tracer.c -shared -nostdlib -o tracer.so
 Loading header, size 5.2 MB
 Segment 0x7f377a400000-0x7f3caa000000 intersects file boundaries, looks like the core dump is truncated.
 ...

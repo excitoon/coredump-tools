@@ -2,10 +2,10 @@ from typing import Callable, Literal, Optional, Union
 
 from utils import read_struct, write_struct, read_bstr, read_str, write_str
 
-import bisect
 import collections
 import contextlib
 import ctypes
+import functools
 import inspect
 import io
 import logging
@@ -59,7 +59,7 @@ class Emulator(object):
     Once an instance is constructed and ready for use, see `call()` to invoke
     functions. `call()` is low-level and accepts integer arguments (which may
     be pointers) and returns the result as an integer.
-    
+
     Use `mem()` to read or write memory of the emulator, and use `reserve()`
     if you need to allocate some space on the stack. Both return a raw I/O
     instance with some convenience methods injected into it, such as
@@ -92,7 +92,6 @@ class Emulator(object):
     # parsed info
     threads: list[utils.Prstatus]
     mappings: list[utils.FileMapping]
-    mappings__keys: list[int]    # start addresses
     auxv: dict[int, int]
     # WARNING: below properties will be absent if __load_symbols() failed
     loaded_objects: list[utils.RtLoadedObject]
@@ -158,6 +157,9 @@ class Emulator(object):
 
         self.__mappings_to_load = sortedcontainers.SortedDict()
         self.__loaded_mappings = sortedcontainers.SortedDict()
+        self.__mapping_paths = {}
+        self.__symbols = collections.defaultdict(set)
+        self.__symbols_by_type_by_addr = collections.defaultdict(sortedcontainers.SortedDict)
 
         # Start by opening the core file
         self.__s3 = boto3.client('s3')
@@ -165,7 +167,7 @@ class Emulator(object):
         self.__filename = filename
         self.__size = self.__s3.head_object(Bucket=self.__s3_path.bucket, Key=self.__s3_path.key)['ContentLength']
 
-        size = 5*1024*1024
+        size = min(5*1024*1024, self.__size)
         print(f'Loading header, size {humanize.naturalsize(size)}')
         self.__header = io.BytesIO(self.__s3.get_object(Bucket=self.__s3_path.bucket, Key=self.__s3_path.key, Range=f'bytes=0-{size-1}')['Body'].read())
 
@@ -181,8 +183,8 @@ class Emulator(object):
 
         # files
         file_note = next((n['n_desc'] for n in notes if n['n_type'] == 'NT_FILE'))
-        self.mappings = utils.sort_and_ensure_disjoint(utils.parse_file_note(file_note), lambda x: x[1])
-        self.mappings__keys = [vma.start for _, vma in self.mappings]
+        self.__mappings = [(k.decode(), v) for k, v in utils.sort_and_ensure_disjoint(utils.parse_file_note(file_note), lambda x: x[1])]
+        self.__mappings_by_addr = sortedcontainers.SortedDict(((vma.start, i) for i, (k, vma) in enumerate(self.__mappings)))
 
         # threads
         self.threads = list(map(utils.Prstatus.load, filter(lambda n: n['n_type'] == 'NT_PRSTATUS', notes)))
@@ -230,7 +232,7 @@ class Emulator(object):
 
         # Load symbols from binary and loaded objects
         if load_symbols:
-            self.__load_symbols(load_symbols)
+            self.__load_symbols()
 
         # Post-load fixups
         logger.info('Performing fixups...')
@@ -309,10 +311,10 @@ class Emulator(object):
 
 
     def __load_mappings(self,
-        whitelist: list[Union[str, bytes]]=[],
-        blacklist: list[Union[str, bytes]]=['/dev/', '/proc/', '/sys/'],
+        whitelist: list[str]=[],
+        blacklist: list[str]=['/dev/', '/proc/', '/sys/'],
         skip_invalid: bool=True, skip_special: bool=True,
-        filename_map: Callable[[bytes], Optional[Union[str, bytes]]] = lambda x: x,
+        filename_map: Callable[[bytes], Optional[bytes]] = lambda x: x,
     ):
         '''Read VMAs from core and map the associated files from disk
 
@@ -328,40 +330,39 @@ class Emulator(object):
         to transform mapped filenames. The function will be called with the original
         filename and must return the filename to access on disk, or None to skip the file.
         '''
-        ensure_bytes = lambda x: x.encode() if isinstance(x, str) else x
 
         # remove mappings that overlap with already loaded regions
-        regions = utils.sort_and_ensure_disjoint((s, e+1) for s, e, _ in self.emu.mem_regions())
+        regions = utils.sort_and_ensure_disjoint(((s, e+1) for s, e, _ in self.emu.mem_regions()))
         mappings = []
-        for fname, (start, end, offset) in self.mappings:
+        for fname, (start, end, offset) in self.__mappings:
             while True:
                 regstart, regend = regions[0] if regions else (end, end)
                 if regend > start:
                     if start < regstart:
                         mappings.append((fname, utils.VMA(start, min(end, regstart), offset)))
-                    if end <= regend: break
+                    if end <= regend:
+                        break
                     start, offset = regend, offset + (regend - start)
                 regions.pop(0)
 
         # collect simplified mappings for each file
         # (note that we keep all files, even if they no longer have VMAs)
-        file_mappings: dict[bytes, list[utils.VMA]] = {fn.decode(): [] for fn, _ in self.mappings}
+        file_mappings: dict[str, list[utils.VMA]] = {fn: [] for fn, _ in self.__mappings}
         for fname, vma in mappings:
-            file_mappings[fname.decode()].append(vma)
+            file_mappings[fname].append(vma)
+
         file_mappings = {k: utils.VMA.simplify(v) for k, v in file_mappings.items()}
 
         # filter / transform files according to settings
         is_invalid = lambda fn: fn.startswith('anon_inode:') or fn.startswith('/memfd:') or fn.endswith(' (deleted)')
         is_special = lambda fn: (fn := filename_map(fn)) != None and os.path.exists(fn) and not os.path.isfile(fn)
-        file_skipped = lambda fn: \
-            (skip_invalid and is_invalid(fn)) or (skip_special and is_special(fn)) \
-            or any(fn.startswith(pref) for pref in blacklist)
+        file_skipped = lambda fn: (skip_invalid and is_invalid(fn)) or (skip_special and is_special(fn)) or any(fn.startswith(pref) for pref in blacklist)
         file_filter = lambda fn: any(fn.startswith(pref) for pref in whitelist) or not file_skipped(fn)
         mapped_filenames = {fn: fn2 for fn in file_mappings if file_filter(fn) and (fn2 := filename_map(fn)) != None}
 
         skipped_with_vmas = [fn for fn, vmas in file_mappings.items() if fn not in mapped_filenames and vmas]
         if skipped_with_vmas:
-            logger.info('Skipped files with VMAs:\n{}'.format('\n'.join(f' - {fn}' for fn in skipped_with_vmas )))
+            logger.info('Skipped files with VMAs:\n{}'.format('\n'.join((f' - {fn}' for fn in skipped_with_vmas))))
         file_mappings = {fn: v for fn, v in file_mappings.items() if fn in mapped_filenames}
         total_mappings = sum(len(v) for v in file_mappings.values())
         logger.info(f'Mapping {len(file_mappings)} files, {total_mappings} VMAs...')
@@ -370,6 +371,7 @@ class Emulator(object):
             try:
                 s3_path = s3path.S3Path.from_uri(mapped_filenames[fn])
                 size = self.__s3.head_object(Bucket=s3_path.bucket, Key=s3_path.key)['ContentLength']
+                self.__mapping_paths[fn] = mapped_filenames[fn]
 
                 print(f'Would load {fn} from {mapped_filenames[fn]}, size {humanize.naturalsize(size)}')
 
@@ -389,6 +391,7 @@ class Emulator(object):
                 print(f'Skipping {fn}')
                 continue
 
+
     def mem(self, start: Union[int, str]=0, size: Optional[int]=None, offset: int=0, buffer_size: int=io.DEFAULT_BUFFER_SIZE):
         '''Returns a binary I/O stream over (a region of) memory
 
@@ -405,6 +408,7 @@ class Emulator(object):
             if not (syms := self.get_symbols(start, stype=utils.Symbol.Type.OBJECT)):
                 raise ValueError(f'no OBJECT symbol found for {start}')
             start, size = syms[0].addr, syms[0].size
+
         stream = utils.UnicornIO(self, start, size, offset)
         # FIXME: BufferedRandom fails with some obscure exception from native code...
         #stream = BufferedRandom(stream, buffer_size) if buffer_size > 0 else stream
@@ -414,7 +418,9 @@ class Emulator(object):
         stream.read_bstr = lambda *args, **kwargs: read_bstr(stream, *args, **kwargs)
         stream.read_str = lambda *args, **kwargs: read_str(stream, *args, **kwargs)
         stream.write_str = lambda *args, **kwargs: write_str(stream, *args, **kwargs)
+
         return stream
+
 
     @contextlib.contextmanager
     def reserve(self, size: int, align=8):
@@ -448,44 +454,34 @@ class Emulator(object):
             if ret_address != new_stack_addr:
                 raise Exception('stack reservations MUST be released in reverse order')
 
+
     def find_mapping(self, addr: int) -> utils.FileMapping:
-        idx = bisect.bisect(self.mappings__keys, addr)
-        if idx > 0 and addr < self.mappings[idx-1][1].end:
-            return self.mappings[idx-1]
+        try:
+            key = next(self.__mappings_by_addr.irange(maximum=addr, reverse=True))
+            nested_key = self.__mappings_by_addr[key]
+            vma = self.__mappings[nested_key][1]
+            if addr < vma.end:
+                return vma
+
+        except StopIteration:
+            pass
+
         raise ValueError(f'address {addr:#x} not mapped')
 
 
     # SYMBOLS
 
-    def __load_symbols(self, load_symbols):
+    def __load_symbols(self):
         '''Find info about loaded objects and load their symbols'''
 
-        if isinstance(load_symbols, str):
-            s3_path = s3path.S3Path.from_uri(load_symbols)
-            size = self.__s3.head_object(Bucket=s3_path.bucket, Key=s3_path.key)['ContentLength']
+        for filename in {k for k, _ in self.__mappings}:
+            self.__load_symbols_for_mapped_file(filename)
 
-            print(f'Loading {load_symbols}, size {humanize.naturalsize(size)}')
-            self.__symbols_data = io.BytesIO(self.__s3.get_object(Bucket=s3_path.bucket, Key=s3_path.key)['Body'].read())
+        return
+        # FIXME rest of it does not work
 
-            self.__symbols = elftools.elf.elffile.ELFFile(self.__symbols_data)
-            assert self.__symbols['e_ident']['EI_OSABI'] in {'ELFOSABI_SYSV', 'ELFOSABI_LINUX'}
-            assert self.__symbols['e_machine'] == 'EM_X86_64'
-            assert self.__symbols['e_type'] == 'ET_EXEC'
-
-            # Parse coredump notes
-            segs = self.__symbols.iter_segments()
-            note_segs = filter(lambda seg: isinstance(seg, elftools.elf.elffile.NoteSegment), segs)
-            notes = [n for seg in note_segs for n in seg.iter_notes()]
-
-            # process
-            # FIXME: parse PRPSINFO
-            auxv = utils.parse_auxv_note(next((n for n in notes if n['n_type'] == 'NT_AUXV')))
-
-            elf = self.__symbols
-
-        else:
-            auxv = self.auxv
-            elf = self.core
+        auxv = self.auxv
+        elf = self.core
 
         # First we need to parse the binary ELF. This is essential;
         # without this we can't use the "debugger interface" to find
@@ -535,14 +531,44 @@ class Emulator(object):
         for obj in sorted(self.loaded_objects, key=lambda x: x.addr):
             self.__load_symbols_for(obj, by_addr)
         self.symbols = dict(self.symbols)
-        self.symbols_by_type_by_addr = {
-            stype: list(zip(*sorted(addrs.items()))) for stype, addrs in by_addr.items() }
+        self.symbols_by_type_by_addr = {stype: list(zip(*sorted(addrs.items()))) for stype, addrs in by_addr.items()}
+
+
+    def __load_symbols_for_mapped_file(self, filename):
+        try:
+            s3_path = s3path.S3Path.from_uri(self.__mapping_paths[filename])
+            size = self.__s3.head_object(Bucket=s3_path.bucket, Key=s3_path.key)['ContentLength']
+
+            # TODO load from `.gnu_debuglink`
+            # TODO load without `pyelftools`
+            # TODO don't double load
+
+            print(f'Loading symbols from {self.__mapping_paths[filename]}, size {humanize.naturalsize(size)}')
+            header = io.BytesIO(self.__s3.get_object(Bucket=s3_path.bucket, Key=s3_path.key, Range=f'bytes=0-{size-1}')['Body'].read())
+
+            # Try to parse its symbols
+            elf = elftools.elf.elffile.ELFFile(header)
+            for table in elf.iter_sections():
+                if not isinstance(table, elftools.elf.sections.SymbolTableSection):
+                    continue
+                for sym in table.iter_symbols():
+                    sym = utils.Symbol.load(None, sym) # FIXME relocs; check self.__mappings and elf tables; also remove failsafe in `Symbol.addr`
+                    if sym.defined:
+                        self.__symbols[sym.name].add(sym)
+                        self.__symbols_by_type_by_addr[sym.type].setdefault(sym.addr, set()).add(sym)
+
+        except Exception:
+            logger.warn(f'failed to parse symbols from {filename}, skipping')
+            return
 
 
     def __load_symbols_for(self, obj: utils.RtLoadedObject, by_addr: dict[utils.Symbol.Type, dict[int, list[utils.Symbol]]]):
         # Find mapped disk file, open it
         if obj.addr != self.auxv.get(utils.AuxvField.SYSINFO_EHDR.value):
             fname, _ = self.find_mapping(obj.ld)
+
+            print(f'Loading symbols for {fname}')
+
             if fname not in self.mappings_mm:
                 logger.warn(f'mappings for {fname} failed or were skipped, its symbols will not be loaded')
                 return
@@ -554,7 +580,7 @@ class Emulator(object):
             # VDSO is special bc kernel doesn't insert a mapping for it,
             # but its pages are always dumped so we can read from memory
             ofname, stream = b'[vdso]', self.mem(obj.addr)
-        
+
         # Try to parse its symbols
         try:
             elf = elftools.elf.elffile.ELFFile(stream)
@@ -563,9 +589,9 @@ class Emulator(object):
                     continue
                 for sym in table.iter_symbols():
                     sym = utils.Symbol.load(obj, sym)
-                    if not sym.defined: continue
-                    self.symbols[sym.name].add(sym)
-                    by_addr[sym.type][sym.addr].add(sym)
+                    if sym.defined:
+                        self.__symbols[sym.name].add(sym)
+                        self.__symbols_by_type_by_addr[sym.type].setdefault(sym.addr, set()).add(sym)
 
             return obj
 
@@ -579,39 +605,43 @@ class Emulator(object):
         obj: Optional[utils.RtLoadedObject]=None,
         exposed_only: bool=False,
     ) -> list[utils.Symbol]:
-        syms = getattr(self, 'symbols', {}).get(name, [])
-        matches = lambda sym: \
-            (obj is None or obj == sym.obj) and \
-            (stype is None or stype == sym.type) and \
-            (not exposed_only or sym.is_exposed)
+
         # FIXME: prioritize global, then weak, then local. also maybe visibility
-        return [sym for sym in syms if matches(sym)]
+        matches = lambda sym: (obj is None or obj == sym.obj) and (stype is None or stype == sym.type) and (not exposed_only or sym.is_exposed)
+        return [sym for sym in self.__symbols[name] if matches(sym)]
 
     def get_symbol(self, name: str, *args, **kwargs) -> int:
-        '''Resolve the address of a symbol (fails if none found)'''
+        """Resolve the address of a symbol (fails if none found)."""
+
         if not (syms := self.get_symbols(name, *args, **kwargs)):
             raise ValueError(f'no matching symbol found for {repr(name)}')
+
         return syms[0].addr
 
-    def find_symbol(self, addr: int,
-        stype: utils.Symbol.Type=utils.Symbol.Type.FUNC, look_before: int=5,
-    ) -> dict:
-        '''Try to find a symbol that addr is in'''
-        assert not (stype is None)
-        keys, buckets = getattr(self, 'symbols_by_type_by_addr', {}).get(stype, ([], []))
-        idx = bisect.bisect(keys, addr)
-        within_size = lambda sym, pos: not sym.size or pos < sym.size
-        filter_syms = lambda baddr, syms: (sym for sym in syms if within_size(sym, addr - baddr))
-        syms = [sym for n in range(min(look_before, idx)) for sym in filter_syms(keys[idx-1-n], buckets[idx-1-n])]
-        if syms: return syms[0]
+    def find_symbol(self, addr: int, stype: utils.Symbol.Type=utils.Symbol.Type.FUNC, look_before: int=5) -> utils.Symbol:
+        """Try to find a symbol that addr is in."""
+
+        by_addr = self.__symbols_by_type_by_addr.get(stype, sortedcontainers.SortedDict())
+        symbols_it = by_addr.irange(maximum=addr, reverse=True)
+        try:
+            for _ in range(look_before):
+                symbols = by_addr[next(symbols_it)]
+                for symbol in symbols:
+                    if not symbol or addr-symbol.addr < symbol.size:
+                        return symbol
+
+        except StopIteration:
+            pass
+
         raise ValueError(f'no {stype.name} symbol found at {addr:#x}')
+
 
     # PATCHES
 
     def __patch_glibc(self):
         '''Patches glibc functions whose name ends in '_avx2' with a JMP to
         their generic siblings, to prevent unsupported instructions.
-        
+
         IFUNCs are defined here:
         https://elixir.bootlin.com/glibc/glibc-2.31/source/sysdeps/i386/i686/multiarch/ifunc-impl-list.c
         https://elixir.bootlin.com/glibc/glibc-2.31/source/sysdeps/x86_64/multiarch/ifunc-impl-list.c
@@ -623,11 +653,12 @@ class Emulator(object):
         if len(objs) != 1:
             logger.warn(f'cannot locate libc, found {len(objs)} candidates. skipping glibc patches...')
             return
+
         libc_obj = next(iter(objs))
 
         # collect libc function addresses
         collect_addresses = lambda syms: {sym.addr for sym in syms if sym.obj == libc_obj and sym.is_function}
-        libc_syms = {name: addrs for name, syms in self.symbols.items() if (addrs := collect_addresses(syms))}
+        libc_syms = {name: addrs for name, syms in self.__symbols.items() if (addrs := collect_addresses(syms))}
 
         # find candidates to patch
         hunks: list[tuple[int, int]] = []
@@ -647,10 +678,11 @@ class Emulator(object):
         # depend on implemented SIMD extensions, we should patch that as well.
         # locate dynamic linker through AUXV, then its symbols:
         try:
-            ld_obj = next(obj for obj in self.loaded_objects
-                if obj.addr == self.auxv[utils.AuxvField.BASE.value])
+            ld_obj = next((obj for obj in self.loaded_objects if obj.addr == self.auxv[utils.AuxvField.BASE.value]))
+
         except StopIteration:
             logger.warn(f'cannot find ld object. skipping ld patches...')
+
         else:
             ld_hunks = [
                 ('_dl_runtime_resolve_xsavec', '_dl_runtime_resolve_fxsave'),
@@ -666,15 +698,18 @@ class Emulator(object):
 
         # patch!
         for src, target in hunks:
-            # jmp QWORD PTR [rip] (jumps to address following instruction)
+            # Far jmp QWORD PTR [rip] (jumps to address following instruction).
             asm = b'\xff\x25\x00\x00\x00\x00'
             self.mem(src).write(asm + struct.pack('<Q', target))
 
 
     def __patch_pthreads(self):
-        '''We can't emulate multithreading, but we can patch mutex functions
-        so that all mutexes appear unlocked and *maybe* it will work'''
-        if not hasattr(self, 'symbols'): return
+        """We can't emulate multithreading, but we can patch mutex functions
+        so that all mutexes appear unlocked and *maybe* it will work"""
+
+        if not hasattr(self, 'symbols'):
+            return
+
         syms = [
             'mutex_lock', 'mutex_trylock', 'mutex_timedlock', 'mutex_unlock',
             'rwlock_wrlock', 'rwlock_trywrlock', 'rwlock_timedwrlock',
@@ -687,37 +722,42 @@ class Emulator(object):
             if not candidates:
                 logger.warn(f'failed to find {name}, skipping patch...')
             for sym in candidates:
-                self.mem(sym.addr).write(b'\x48\x31\xC0\xC3')  # xor rax, rax; ret
+                self.mem(sym.addr).write(b'\x48\x31\xC0\xC3') # xor rax, rax; ret
 
 
     # EMULATION
 
     def format_code_addr(self, addr: int):
-        '''Format a code address nicely by showing it as symbol + offset
-        and shared object + offset, if possible.'''
+        """Format a code address nicely by showing it as symbol + offset
+        and shared object + offset, if possible."""
+
         try:
-            # try to find symbol first
+            # Try to find symbol first.
             sym = self.find_symbol(addr)
+
         except ValueError:
             pass
+
         else:
             pos = addr - sym.addr
             pos = f'[{pos:#x}]' if pos else ''
-            fname = sym.obj.name.decode(errors='ignore')
-            offset = addr - sym.obj.addr
+            fname = sym.obj and sym.obj.name.decode() or 'fixme' # FIXME
+            offset = addr - (sym.obj and sym.obj.addr or 0) # FIXME
             return f'{addr:#x} {sym.name}{pos} ({fname}[{offset:#x}])'
 
         try:
-            # try mapping next
+            # Try mapping next.
             fname, vma = self.find_mapping(addr)
+
         except ValueError:
             pass
+
         else:
-            fname = fname.decode(errors='replace')
             offset = vma.offset + (addr - vma.start)
             return f'{addr:#x} ({fname}[{offset:#x}])'
 
         return f'{addr:#x}'
+
 
     def format_exec_ctx(self):
         '''Collect info about the current execution context and return it
@@ -728,7 +768,7 @@ class Emulator(object):
             self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RIP),
         )]
         format_call = lambda sp, ip: f'  at {self.format_code_addr(ip)}, sp={sp:#x}'
-        return '\n'.join(format_call(*c) for c in trace)
+        return '\n'.join((format_call(*c) for c in trace))
 
     def __emulation_error(self, msg: str):
         return EmulationError(f'{msg}\n{self.format_exec_ctx()}')
@@ -760,8 +800,7 @@ class Emulator(object):
 
             assert fname not in self.mappings_mm
 
-            raise self.__emulation_error(
-                f'{text}, which belongs to a file that was skipped or failed to load')
+            raise self.__emulation_error(f'{text}, which belongs to a file that was skipped or failed to load')
 
 
     def __hook_insn_invalid(self):
@@ -788,10 +827,8 @@ class Emulator(object):
         self.emu.reg_write(unicorn.unicorn.x86_const.UC_X86_REG_RAX, result)
 
     # FIXME: implement more archs and calling conventions
-    def call(
-        self, func: Union[int, str], *args: int,
-        instruction_limit: int = 10000000, time_limit: int = 0,
-    ) -> int:
+    def call(self, func: Union[int, str], *args: int, instruction_limit: int = 10000000, time_limit: int = 0) -> int:
+        # FIXME C++ names mangling
         '''Emulate a function call.
 
         The first parameter is the address of the function to call. If it
@@ -810,13 +847,12 @@ class Emulator(object):
         func = self.get_symbol(func) if isinstance(func, str) else func
         ret_addr = self.stack_base
         emu.context_restore(self.emu_ctx)
-        if self.stack_tracer: self.stack_tracer.clear()
+        if self.stack_tracer:
+            self.stack_tracer.clear()
 
         # set up arguments
-        assert all(isinstance(x, int) for x in args), \
-            'float and other non-integer arguments not implemented yet'
-        assert all(-(1 << 63) <= x < (1 << 64) for x in args), \
-            'arguments must be in u64 or s64 range (128 ints not implemented yet)'
+        assert all(isinstance(x, int) for x in args), 'float and other non-integer arguments not implemented yet'
+        assert all(-(1 << 63) <= x < (1 << 64) for x in args), 'arguments must be in u64 or s64 range (128 ints not implemented yet)'
         args = [x & ~((~0) << 64) for x in args]
         arg_regs = utils.SYSV_AMD_ARG_REGS
         for p, reg in zip(args, arg_regs): emu.reg_write(reg, p)
