@@ -209,6 +209,8 @@ class Emulator(object):
             (unicorn.unicorn.uc.UC_HOOK_MEM_INVALID, self.__hook_mem),
             (unicorn.unicorn.uc.UC_HOOK_INSN_INVALID, self.__hook_insn_invalid),
             (unicorn.unicorn.uc.UC_HOOK_INTR, self.__hook_intr),
+            (unicorn.unicorn.uc.UC_HOOK_CODE, self.__hook_code),
+            (unicorn.unicorn.uc.UC_HOOK_BLOCK, self.__hook_block),
             (unicorn.unicorn.uc.UC_HOOK_INSN, self.__hook_insn_syscall, unicorn.unicorn.x86_const.UC_X86_INS_SYSCALL),
             (unicorn.unicorn.uc.UC_HOOK_INSN, self.__hook_insn_sysenter, unicorn.unicorn.x86_const.UC_X86_INS_SYSENTER)
         ]
@@ -773,6 +775,20 @@ class Emulator(object):
     def __emulation_error(self, msg: str):
         return EmulationError(f'{msg}\n{self.format_exec_ctx()}')
 
+    def __hook_code(self, addr: int, size: int):
+        code = self.emu.mem_read(addr, size)
+        iced = iced_x86.Decoder(64, code, ip=addr)
+        for instr in iced:
+            bytes_str = code[instr.ip-addr:instr.ip-addr+instr.len].hex().upper()
+            print(f'{instr.ip:016X} {bytes_str:20} {" "*self.__call_depth*4}{instr:n}')
+            if instr.mnemonic == iced_x86.Mnemonic.CALL:
+                self.__call_depth += 1
+            elif instr.mnemonic in (iced_x86.Mnemonic.RET, iced_x86.Mnemonic.RETF):
+                self.__call_depth -= 1
+
+    def __hook_block(self, addr: int, size: int):
+        pass
+
     def __hook_mem(self, htype: int, addr: int, size: int, value: int):
         access_type, cause = utils.UC_MEM_TYPES[htype]
         faddr = self.format_code_addr(addr)
@@ -785,9 +801,11 @@ class Emulator(object):
             if self.load_address_if_needed(addr):
                 return True
 
+            print('-'*64)
             rip = self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RIP)
             code = self.emu.mem_read(rip, 64)
-            iced = iced_x86.Decoder(64, code, ip=rip)
+            iced = iter(iced_x86.Decoder(64, code, ip=rip))
+            next(iced)
             for instr in iced:
                 bytes_str = code[instr.ip-rip:instr.ip-rip+instr.len].hex().upper()
                 print(f'{instr.ip:016X} {bytes_str:20} {instr:n}')
@@ -850,6 +868,7 @@ class Emulator(object):
         emu = self.emu
         func = self.get_symbol(func) if isinstance(func, str) else func
         ret_addr = self.stack_base
+        self.__call_depth = 0
         emu.context_restore(self.emu_ctx)
         if self.stack_tracer:
             self.stack_tracer.clear()
