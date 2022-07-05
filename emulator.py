@@ -209,8 +209,8 @@ class Emulator(object):
             (unicorn.unicorn.uc.UC_HOOK_MEM_INVALID, self.__hook_mem),
             (unicorn.unicorn.uc.UC_HOOK_INSN_INVALID, self.__hook_insn_invalid),
             (unicorn.unicorn.uc.UC_HOOK_INTR, self.__hook_intr),
-            (unicorn.unicorn.uc.UC_HOOK_INSN, lambda: self.__hook_intr('syscall'), unicorn.unicorn.x86_const.UC_X86_INS_SYSCALL),
-            (unicorn.unicorn.uc.UC_HOOK_INSN, lambda: self.__hook_intr('sysenter'), unicorn.unicorn.x86_const.UC_X86_INS_SYSENTER),
+            (unicorn.unicorn.uc.UC_HOOK_INSN, self.__hook_insn_syscall, unicorn.unicorn.x86_const.UC_X86_INS_SYSCALL),
+            (unicorn.unicorn.uc.UC_HOOK_INSN, self.__hook_insn_sysenter, unicorn.unicorn.x86_const.UC_X86_INS_SYSENTER)
         ]
         for hook, cb, *args in hooks:
             self.emu.hook_add(hook, (lambda cb: lambda *args: cb(*args[1:-1]))(cb), None, 1, 0, *args)
@@ -806,10 +806,13 @@ class Emulator(object):
     def __hook_insn_invalid(self):
         raise self.__emulation_error('invalid instruction')
 
-    def __hook_intr(self, intno: Union[int, Literal['syscall', 'sysenter']]):
-        if intno != 'syscall': # FIXME: x86-32
-            raise self.__emulation_error(f'invalid interrupt {intno}')
+    def __hook_intr(self, intno: int):
+        raise self.__emulation_error(f'invalid interrupt {intno}')
 
+    def __hook_insn_sysenter(self):
+        raise self.__emulation_error(f'invalid interrupt sysenter')
+
+    def __hook_insn_syscall(self):
         nr = self.emu.reg_read(unicorn.unicorn.x86_const.UC_X86_REG_RAX)
         try:
             nr = syscall.SyscallX64(nr)
@@ -825,6 +828,7 @@ class Emulator(object):
         else:
             assert isinstance(result, int) and result >= 0
         self.emu.reg_write(unicorn.unicorn.x86_const.UC_X86_REG_RAX, result)
+
 
     # FIXME: implement more archs and calling conventions
     def call(self, func: Union[int, str], *args: int, instruction_limit: int = 10000000, time_limit: int = 0) -> int:
