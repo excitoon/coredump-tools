@@ -776,6 +776,7 @@ class Emulator(object):
         return EmulationError(f'{msg}\n{self.format_exec_ctx()}')
 
     def __hook_code(self, addr: int, size: int):
+        # TODO option to disable tracing
         code = self.emu.mem_read(addr, size)
         iced = iced_x86.Decoder(64, code, ip=addr)
         for instr in iced:
@@ -787,6 +788,7 @@ class Emulator(object):
                 self.__call_depth -= 1
 
     def __hook_block(self, addr: int, size: int):
+        # TODO block-wise disassembling
         pass
 
     def __hook_mem(self, htype: int, addr: int, size: int, value: int):
